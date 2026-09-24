@@ -1,13 +1,12 @@
-# THIRD CAMPAIGN POC MATRIX
+# THIRD CAMPAIGN POC MATRIX (Foundry 1.5.1 + solc 0.8.30 vs AquaSwapVMRouter v1.0.2 + Aqua v1.0.0)
 
-Harness: Foundry 1.5.1 + solc 0.8.30 vs AquaSwapVMRouter(v1.0.2)+Aqua(v1.0.0).
-Run: forge test --offline --use ~/.svm/0.8.30/solc-0.8.30 --match-path 'test/adv/AdvInvariantsAqua.t.sol' -vv
+Run: forge test --offline --use ~/.svm/0.8.30/solc-0.8.30 --match-path 'test/adv/*' --fuzz-runs 5000 -vv
 
-| test | composition | invariants checked | result |
-|------|-------------|--------------------|--------|
-| test_inv_pegged_aqua | PeggedSwap (aqua) | symmetry, quote/swap, monotonicity, additivity, rounding-favors-maker, balance-suff | PASS |
-| test_inv_pegged_decay_aqua | Decay->PeggedSwap (aqua) | symmetry, quote/swap, monotonicity, rounding, balance-suff (additivity skipped: decay is intentionally sub-additive/stateful) | PASS |
-| test_inv_pegged_fee_aqua | aquaFee->PeggedSwap (aqua) | quote/swap, monotonicity, additivity, balance-suff (spot/symmetry skipped: fee alters effective spot) | PASS |
+| PoC | attacks audit finding | runs | result |
+|-----|-----------------------|------|--------|
+| AdvPeggedInvariant.t.sol | OZ Critical-1 (precision) + Critical-3 (axis): invariant C non-decrease | 4×5000 | PASS (C holds; near-zero A, asym anchors, reverse dir, rates) |
+| AdvConcentrateHook.t.sol | OZ Medium hook-injection (taker preTransferOutCallback vector) | 4000 + fixed | PASS (taker loss; no gain) |
+| AdvInvariantsAqua.t.sol | repo CoreInvariants on untested Aqua-mode compositions | fixed | PASS (Pegged, Pegged+Decay, Pegged+Fee) |
+| (campaign 2) AdvConservation/AdvFeeStack/AdvSkipConc/AdvFuzz/AdvNested/AdvBoundary/AdvAuth | fee accounting, skip, stacked, round-trips, cross-order, auth binding | 3–8k each | PASS |
 
-No malicious-case PoC (no invariant broke). Deterministic, non-fuzz (fixed realistic params: reserves 1e21,
-A=100e27, amounts {1,10,50}e18).
+No malicious-case PoC exists (no invariant broke; no taker profit found).

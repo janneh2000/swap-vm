@@ -1,9 +1,13 @@
 # THIRD CAMPAIGN DUPLICATE LEDGER
 
-No submittable candidate ⇒ nothing to firewall. Context:
-- Audit PDF unavailable this session (egress-blocked hosts + attachment not on disk), so exact-finding
-  duplicate matching is deferred until the PDF is provided.
-- Known findings (fee best-effort M-09/Theori#10; PeggedSwap criticals; multi-token caveat) are all either
-  robust-under-attack, benign-rounding, or maker-config — none reproduced as novel impact.
-- The one genuinely NEW artifact this campaign (running the repo invariant suite on the real Aqua path for
-  Pegged/Pegged+Decay/Pegged+Fee) produced PASSES, i.e. confirmations of soundness, not findings.
+Full audit archive in hand (8 firms v1 + 5 firms v1.0.2). Cross-checked every candidate root-cause:
+- All Critical/High root causes (PeggedSwap precision + axis, XYCConcentrate multi-token/state, fee
+  accounting) were found by multiple firms and FIXED in v1.0.2; my tests confirm the fixes hold, so there
+  is no un-fixed instance to report.
+- All live/acknowledged findings (hook injection, Calldata.slice, unrestricted push, fee-on-fee, fee
+  revert on maker shortfall, Extruction, Decay griefing, ship reinit, maker-hook subsidy, fee-token
+  blocklist) are documented accepted risks / maker-config / DoS / fee-revenue-loss — already reported by
+  the auditors and acknowledged by the team. Re-reporting any would be a DUPLICATE.
+- No distinct, novel root cause with a new unprivileged-taker capability was discovered.
+
+Nothing to submit.
