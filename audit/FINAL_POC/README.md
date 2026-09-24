@@ -33,6 +33,10 @@ and drive real Aqua ship/swap through the repo's own AquaSwapVMTest base.
 | **AdvCanonicalFull.t.sol** | **(4th campaign)** exact deployed program `[aquaProtocolFee][concentrate][xycSwap]` over real Aqua: wei-exact conservation, register==real, no round-trip profit, across every taker lever + fee 0..50% (3000 runs) |
 | **AdvBackwardJump.t.sol** | **(4th campaign)** backward `_jump` re-execution on XYCSwap/Fee/Concentrate reverts via recompute guards; green single-settle baseline control |
 
-Full suite: **15 test files, 34 tests, 0 failures.** All pass at realistic scales.
-No confirmed novel taker-exploitable bug across four campaigns — see
-`../FINAL_FOURTH_CAMPAIGN_ASSESSMENT.md`.
+| **AdvIntegrationDecode.t.sol** | **(5th campaign)** hand-crafted malformed takerData (raw TakerTraits header, non-monotonic slice offsets → Calldata.slice begin>end underflow); maker accounting unreachable (revert or real==virtual & curve-bound; 256-run fuzz) |
+| **AdvIntegrationExtruction.t.sol** | **(5th campaign)** Extruction escape hatch bounded: can't conjure funds (pull underflow reverts), can't overcharge taker (amount-binding reverts), within-balance conserves real==virtual |
+| **AdvIntegrationRouter.t.sol** | **(5th campaign)** opcode-table divergence between AquaOpcodes/base Opcodes neutralized — cross-router execution fails safe (empty app-keyed balances); shipped-router balances intact |
+
+Full suite: **18 test files, 41 tests, 0 failures.** All pass at realistic scales.
+No confirmed novel taker-exploitable bug across five campaigns (core invariants + integration
+layer) — see `../FINAL_FOURTH_CAMPAIGN_ASSESSMENT.md` and `../FINAL_FIFTH_CAMPAIGN_ASSESSMENT.md`.
