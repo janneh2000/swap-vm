@@ -26,5 +26,13 @@ and drive real Aqua ship/swap through the repo's own AquaSwapVMTest base.
 | AdvAuth.t.sol | authorization binding: cannot strip fee instruction / use foreign token / same-token (all revert) |
 | AdvBoundary.t.sol | Pegged(+Decay,+rate/decimal asymmetry) round-trip maker-favorable at realistic scale (<=1e24) |
 | AdvPeggedMin.t.sol | scale-scan + amplification: characterizes the benign extreme-scale (>=~1e25) rounding surplus (KILLED) |
+| AdvInvariantsAqua.t.sol | repo's own CoreInvariants over the REAL Aqua path for Pegged, Pegged∘Decay, Pegged∘Fee (repo tests these only in sig mode) |
+| AdvConcentrateHook.t.sol | malicious taker `Aqua.push` in preTransferOutCallback to bypass sufficiency + reverse — pushed value credits maker; taker net loss, no round-trip profit |
+| AdvPeggedInvariant.t.sol | PeggedSwap invariant C non-decreasing (OZ C-1/C-3 re-attack): near-zero A, asymmetric anchors, reverse dir, rate/decimal asymmetry |
+| AdvFeeDecay.t.sol | canonical `[fee][decay][xyc]` (both orderings) conservation + time-warped 2nd swap with decay state active |
+| **AdvCanonicalFull.t.sol** | **(4th campaign)** exact deployed program `[aquaProtocolFee][concentrate][xycSwap]` over real Aqua: wei-exact conservation, register==real, no round-trip profit, across every taker lever + fee 0..50% (3000 runs) |
+| **AdvBackwardJump.t.sol** | **(4th campaign)** backward `_jump` re-execution on XYCSwap/Fee/Concentrate reverts via recompute guards; green single-settle baseline control |
 
-All pass at realistic scales. No confirmed novel taker-exploitable bug.
+Full suite: **15 test files, 34 tests, 0 failures.** All pass at realistic scales.
+No confirmed novel taker-exploitable bug across four campaigns — see
+`../FINAL_FOURTH_CAMPAIGN_ASSESSMENT.md`.
