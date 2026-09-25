@@ -1,0 +1,79 @@
+{
+  "register": "0xa58b634c10df2665a3de1680675d5bb9065847d2",
+  "core": "0x3c316bcf47c991ba09622d4c2f40f786ab4f46db",
+  "yld": "0xd33c37a90155be8fcab769e38a563e74bfd70e0b",
+  "treasury": "0x94be8b620b0d0b6db6f7a5b1bab150765d1e59a5",
+  "splitter_role_holders": [],
+  "role_lookup": "logs",
+  "fetched": {
+    "Register": {
+      "verified": true,
+      "name": "ERC1967Proxy",
+      "compiler": "v0.8.29+commit.ab55807c",
+      "impl": "0xd6b4a2ee285cd4d8290bd2657578962b5ed930ef",
+      "proxy": "1",
+      "files": [
+        "@openzeppelin/contracts/access/Ownable.sol",
+        "@openzeppelin/contracts/interfaces/IERC1967.sol",
+        "@openzeppelin/contracts/proxy/beacon/BeaconProxy.sol",
+        "@openzeppelin/contracts/proxy/beacon/IBeacon.sol",
+        "@openzeppelin/contracts/proxy/beacon/UpgradeableBeacon.sol",
+        "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol",
+        "@openzeppelin/contracts/proxy/ERC1967/ERC1967Utils.sol",
+        "@openzeppelin/contracts/proxy/Proxy.sol",
+        "@openzeppelin/contracts/proxy/transparent/ProxyAdmin.sol",
+        "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol",
+        "@openzeppelin/contracts/utils/Address.sol",
+        "@openzeppelin/contracts/utils/Context.sol",
+        "@openzeppelin/contracts/utils/Errors.sol",
+        "@openzeppelin/contracts/utils/StorageSlot.sol"
+      ]
+    },
+    "Core": {
+      "verified": true,
+      "name": "ERC1967Proxy",
+      "compiler": "v0.8.29+commit.ab55807c",
+      "impl": "0xf4a73dc62a09ae4d14a99844d4cc9d51aa9f78db",
+      "proxy": "1",
+      "files": [
+        "@openzeppelin/contracts/access/Ownable.sol",
+        "@openzeppelin/contracts/interfaces/IERC1967.sol",
+        "@openzeppelin/contracts/proxy/beacon/BeaconProxy.sol",
+        "@openzeppelin/contracts/proxy/beacon/IBeacon.sol",
+        "@openzeppelin/contracts/proxy/beacon/UpgradeableBeacon.sol",
+        "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol",
+        "@openzeppelin/contracts/proxy/ERC1967/ERC1967Utils.sol",
+        "@openzeppelin/contracts/proxy/Proxy.sol",
+        "@openzeppelin/contracts/proxy/transparent/ProxyAdmin.sol",
+        "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol",
+        "@openzeppelin/contracts/utils/Address.sol",
+        "@openzeppelin/contracts/utils/Context.sol",
+        "@openzeppelin/contracts/utils/Errors.sol",
+        "@openzeppelin/contracts/utils/StorageSlot.sol"
+      ]
+    },
+    "YLD": {
+      "verified": true,
+      "name": "ERC1967Proxy",
+      "compiler": "v0.8.29+commit.ab55807c",
+      "impl": "0x930694b049e1cc8692c72d4b08b3829dd76da777",
+      "proxy": "1",
+      "files": [
+        "@openzeppelin/contracts/access/Ownable.sol",
+        "@openzeppelin/contracts/interfaces/IERC1967.sol",
+        "@openzeppelin/contracts/proxy/beacon/BeaconProxy.sol",
+        "@openzeppelin/contracts/proxy/beacon/IBeacon.sol",
+        "@openzeppelin/contracts/proxy/beacon/UpgradeableBeacon.sol",
+        "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol",
+        "@openzeppelin/contracts/proxy/ERC1967/ERC1967Utils.sol",
+        "@openzeppelin/contracts/proxy/Proxy.sol",
+        "@openzeppelin/contracts/proxy/transparent/ProxyAdmin.sol",
+        "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol",
+        "@openzeppelin/contracts/utils/Address.sol",
+        "@openzeppelin/contracts/utils/Context.sol",
+        "@openzeppelin/contracts/utils/Errors.sol",
+        "@openzeppelin/contracts/utils/StorageSlot.sol"
+      ]
+    }
+  }
+}
