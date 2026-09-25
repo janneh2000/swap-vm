@@ -1,0 +1,10 @@
+[profile.default]
+solc_version = "0.8.30"
+optimizer = true
+optimizer_runs = 200
+evm_version = "cancun"
+src = "contracts"
+test = "test"
+libs = ["lib"]
+remappings_file = "remappings.txt"
+fs_permissions = []

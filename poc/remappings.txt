@@ -1,0 +1,3 @@
+@openzeppelin/=oz/@openzeppelin/
+forge-std/=lib/forge-std/src/
+@stbl-protocol/stbl-contracts-evm-core/contracts/=contracts/
