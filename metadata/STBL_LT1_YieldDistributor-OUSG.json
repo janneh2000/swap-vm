@@ -1,0 +1,71 @@
+{
+  "label": "STBL_LT1_YieldDistributor-OUSG",
+  "chainid": 1,
+  "proxy": "0x50eda4294d9a57b35a9d836faaeb88d1c4fab6c9",
+  "impl_slot": "0xa6de551fea53b0d0e3e69c8e32343711bb6becfe",
+  "beacon_slot": null,
+  "admin_slot": null,
+  "current_impl": "0xa6de551fea53b0d0e3e69c8e32343711bb6becfe",
+  "prior_impl": null,
+  "upgrade_history": [
+    {
+      "impl": "0xa6de551fea53b0d0e3e69c8e32343711bb6becfe",
+      "block": 23461432,
+      "timestamp": 1759061747
+    }
+  ],
+  "upgrade_history_error": null,
+  "current_impl_creation": {
+    "creator": "0x94be8b620b0d0b6db6f7a5b1bab150765d1e59a5",
+    "txHash": "0x983982c65b2666cc49922f0c932629e8ea9bcc44ab0231221db803696dfd5084",
+    "block": 23461429,
+    "timestamp": 1759061711
+  },
+  "classify_timestamp": 1759061747,
+  "classify_datetime_utc": "2025-09-28T12:15:47+00:00",
+  "classification": "UNCHANGED",
+  "current_source": {
+    "ContractName": "STBL_LT1_YieldDistributor",
+    "CompilerVersion": "v0.8.28+commit.7893614a",
+    "OptimizationUsed": "1",
+    "Runs": "200",
+    "EVMVersion": "paris",
+    "Proxy": "0",
+    "Implementation": "",
+    "LicenseType": "",
+    "verified": true,
+    "files": [
+      "contracts/Assets/LT1/STBL_LT1_YieldDistributor.sol",
+      "node_modules/@openzeppelin/contracts-upgradeable/metatx/ERC2771ContextUpgradeable.sol",
+      "node_modules/@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol",
+      "node_modules/@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol",
+      "node_modules/@openzeppelin/contracts/token/ERC20/IERC20.sol",
+      "node_modules/@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol",
+      "contracts/interfaces/ISTBL_Register.sol",
+      "contracts/interfaces/ISTBL_Core.sol",
+      "contracts/interfaces/ISTBL_YLD.sol",
+      "contracts/lib/STBL_AssetDefinitionLib.sol",
+      "contracts/lib/STBL_Structs.sol",
+      "contracts/lib/STBL_Errors.sol",
+      "contracts/Assets/LT1/interfaces/ISTBL_LT1_AssetVault.sol",
+      "contracts/Assets/LT1/interfaces/ISTBL_LT1_AssetIssuer.sol",
+      "contracts/Assets/LT1/interfaces/ISTBL_LT1_AssetYieldDistributor.sol",
+      "contracts/Assets/LT1/lib/STBL_LT1_Asset_Errors.sol",
+      "node_modules/@openzeppelin/contracts-upgradeable/utils/ContextUpgradeable.sol",
+      "node_modules/@openzeppelin/contracts/interfaces/draft-IERC1822.sol",
+      "node_modules/@openzeppelin/contracts/proxy/ERC1967/ERC1967Utils.sol",
+      "node_modules/@openzeppelin/contracts/interfaces/IERC1363.sol",
+      "node_modules/@openzeppelin/contracts/access/IAccessControl.sol",
+      "node_modules/@openzeppelin/contracts/token/ERC721/IERC721.sol",
+      "node_modules/@openzeppelin/contracts/proxy/beacon/IBeacon.sol",
+      "node_modules/@openzeppelin/contracts/interfaces/IERC1967.sol",
+      "node_modules/@openzeppelin/contracts/utils/Address.sol",
+      "node_modules/@openzeppelin/contracts/utils/StorageSlot.sol",
+      "node_modules/@openzeppelin/contracts/interfaces/IERC20.sol",
+      "node_modules/@openzeppelin/contracts/interfaces/IERC165.sol",
+      "node_modules/@openzeppelin/contracts/utils/introspection/IERC165.sol",
+      "node_modules/@openzeppelin/contracts/utils/Errors.sol"
+    ],
+    "source_sha256": "8097dc32db536a880be8c79a415286dc0b4d2ef5d015b1ac1b45605dab60e803"
+  }
+}

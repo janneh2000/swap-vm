@@ -1,0 +1,4298 @@
+diff -ruN sources/STBL_PT1_Vault-OUSG//prior/contracts/Assets/PT1/STBL_PT1_Vault.sol sources/STBL_PT1_Vault-OUSG//current/contracts/Assets/PT1/STBL_PT1_Vault.sol
+--- sources/STBL_PT1_Vault-OUSG//prior/contracts/Assets/PT1/STBL_PT1_Vault.sol	2026-09-24 23:43:10
++++ sources/STBL_PT1_Vault-OUSG//current/contracts/Assets/PT1/STBL_PT1_Vault.sol	1969-12-31 21:00:00
+@@ -1,499 +0,0 @@
+-// SPDX-License-Identifier: MIT
+-pragma solidity ^0.8.20;
+-
+-import "@openzeppelin/contracts-upgradeable/metatx/ERC2771ContextUpgradeable.sol";
+-import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+-import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+-
+-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+-
+-import "../../interfaces/ISTBL_Register.sol";
+-import "../../interfaces/ISTBL_Core.sol";
+-
+-import "./interfaces/ISTBL_PT1_AssetIssuer.sol";
+-import "./interfaces/ISTBL_PT1_AssetVault.sol";
+-import "./interfaces/ISTBL_PT1_AssetYieldDistributor.sol";
+-import "./interfaces/ISTBL_PT1_AssetOracle.sol";
+-
+-import "../../lib/STBL_AssetDefinitionLib.sol";
+-import "../../lib/STBL_Structs.sol";
+-import "../../lib/STBL_Errors.sol";
+-import "../../lib/STBL_DecimalConverter.sol";
+-
+-import "./lib/STBL_OracleLib.sol";
+-import "./lib/STBL_PT1_Asset_Errors.sol";
+-
+-/**
+- * @title STBL Protocol Type 1 Asset Vault
+- * @notice Manages secure storage, deposits, withdrawals, and yield distribution for protocol assets
+- * @dev Upgradeable vault contract implementing ERC2771 meta-transaction support with comprehensive fee tracking
+- * @dev Handles asset custody operations including deposits, withdrawals, yield calculations, and fee management
+- * @author STBL Protocol Team
+- * @custom:version 1.0.0
+- * @custom:security-contact security@stblprotocol.com
+- */
+-contract STBL_PT1_Vault is
+-    Initializable,
+-    iSTBL_PT1_AssetVault,
+-    ERC2771ContextUpgradeable,
+-    UUPSUpgradeable
+-{
+-    using SafeERC20 for IERC20;
+-    using STBL_AssetDefinitionLib for AssetDefinition;
+-    using STBL_OracleLib for iSTBL_PT1_AssetOracle;
+-    using DecimalConverter for uint256;
+-
+-    /** @notice Role identifier for contract upgrade authorization */
+-    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+-
+-    /** @notice Current implementation version for upgrade tracking */
+-    uint256 private _version;
+-
+-    /** @notice Protocol registry contract providing system configuration and access control */
+-    iSTBL_Register private registry;
+-
+-    /** @notice Unique identifier for the asset type managed by this vault instance */
+-    uint256 private assetID;
+-
+-    /** @notice Complete vault state including deposits, fees, yields, and tracking metrics */
+-    VaultStruct private VaultData;
+-
+-    /** @dev Reserved storage slots for future contract upgrades (60 slots = 1920 bytes) */
+-    uint256[60] private __gap;
+-
+-    /**
+-     * @notice Validates that the caller is an authorized issuer for the managed asset
+-     * @dev Queries registry for asset definition and verifies issuer permissions
+-     * @dev Reverts with STBL_Asset_InvalidIssuer if authorization fails
+-     */
+-    modifier isValidIssuer() {
+-        AssetDefinition memory AssetData = registry.fetchAssetData(assetID);
+-        if (!AssetData.isIssuer(msg.sender))
+-            revert STBL_Asset_InvalidIssuer(assetID);
+-        _;
+-    }
+-
+-    /**
+-     * @notice Initializes the contract implementation without setting up state
+-     * @dev Constructor for upgradeable contracts - actual initialization happens in initialize()
+-     * @dev Sets up ERC2771Context with zero address (forwarder set later via registry)
+-     * @custom:oz-upgrades-unsafe-allow constructor
+-     */
+-    constructor() ERC2771ContextUpgradeable(address(0)) {}
+-
+-    /**
+-     * @notice Initializes the vault with asset ID and registry configuration
+-     * @dev Sets up access control, UUPS upgradeability, and associates vault with specific asset
+-     * @dev Can only be called once during proxy deployment
+-     * @param _id Unique identifier of the asset this vault will manage
+-     * @param _registry Address of the protocol registry containing system configuration
+-     */
+-    function initialize(uint256 _id, address _registry) public initializer {
+-        __UUPSUpgradeable_init();
+-
+-        registry = iSTBL_Register(_registry);
+-        assetID = _id;
+-    }
+-
+-    /**
+-     * @notice Authorizes contract upgrades for addresses with UPGRADER_ROLE
+-     * @dev Validates upgrade permissions through registry and increments version counter
+-     * @dev Required by UUPS proxy pattern for upgrade authorization
+-     * @param newImplementation Address of the new implementation contract to upgrade to
+-     */
+-    function _authorizeUpgrade(address newImplementation) internal override {
+-        if (!registry.hasRole(UPGRADER_ROLE, _msgSender()))
+-            revert STBL_UnauthorizedCaller();
+-        _version = _version + 1;
+-        emit ContractUpgraded(newImplementation);
+-    }
+-
+-    /**
+-     * @notice Returns the current contract implementation version
+-     * @dev Version increments with each successful upgrade for tracking purposes
+-     * @return Current version number of the contract implementation
+-     */
+-    function version() external view returns (uint256) {
+-        return _version;
+-    }
+-
+-    /**
+-     * @notice Processes ERC20 token deposits into the vault with comprehensive fee tracking
+-     * @dev Transfers tokens from depositor, calculates fees using oracle pricing, and updates vault state
+-     * @dev Records gross/net deposits, USD values, and fee breakdowns with decimal conversion
+-     * @dev Only callable by authorized asset issuers
+-     * @param _from Address of the depositor providing the tokens
+-     * @param MetaData Comprehensive deposit information including amounts, fees, and haircuts
+-     * @custom:event depositEvent Emitted with complete deposit details including fee calculations
+-     */
+-    function depositERC20(
+-        address _from,
+-        YLD_Metadata memory MetaData
+-    ) external isValidIssuer {
+-        AssetDefinition memory AssetData = registry.fetchAssetData(assetID);
+-
+-        IERC20(AssetData.token).safeTransferFrom(
+-            _from,
+-            address(this),
+-            MetaData.assetValue.convertFrom18Decimals(
+-                DecimalConverter.getTokenDecimals(AssetData.token)
+-            )
+-        );
+-
+-        uint256 depositFeesAssetValue = iSTBL_PT1_AssetOracle(AssetData.oracle)
+-            .fetchInversePrice(MetaData.depositfeeAmount);
+-        uint256 insuranceFeeAssetValue = iSTBL_PT1_AssetOracle(AssetData.oracle)
+-            .fetchInversePrice(MetaData.insurancefeeAmount);
+-
+-        /** Store asset Values gross and net */
+-        VaultData.assetDepositGross += MetaData.assetValue;
+-        VaultData.assetDepositNet += (MetaData.assetValue -
+-            (depositFeesAssetValue + insuranceFeeAssetValue));
+-
+-        /** Aggregate Stable Value distributed */
+-        VaultData.depositValueUSD +=
+-            MetaData.stableValueNet +
+-            MetaData.haircutAmount;
+-
+-        /** Aggregate fees Values added */
+-        VaultData.depositFees += depositFeesAssetValue;
+-        VaultData.insuranceFees += insuranceFeeAssetValue;
+-
+-        /** Aggregate haircut Values added */
+-        VaultData.cumilativeHairCutValue += MetaData.haircutAmount;
+-
+-        emit depositEvent(
+-            AssetData.token,
+-            _from,
+-            MetaData.assetValue,
+-            MetaData.depositfeeAmount,
+-            MetaData.insurancefeeAmount,
+-            MetaData.haircutAmount,
+-            depositFeesAssetValue,
+-            insuranceFeeAssetValue
+-        );
+-    }
+-
+-    /**
+-     * @notice Processes ERC20 token withdrawals from the vault with fee deduction and state updates
+-     * @dev Calculates withdrawal amounts using oracle pricing, applies fees, and transfers tokens
+-     * @dev Updates vault balances by reducing deposits, USD tracking, and haircut values
+-     * @dev Only callable by authorized asset issuers
+-     * @param _to Address that will receive the withdrawn tokens
+-     * @param MetaData Comprehensive withdrawal information including amounts, fees, and haircuts
+-     * @custom:event withdrawEvent Emitted with complete withdrawal details including fee calculations
+-     */
+-    function withdrawERC20(
+-        address _to,
+-        YLD_Metadata memory MetaData
+-    ) external isValidIssuer {
+-        AssetDefinition memory AssetData = registry.fetchAssetData(assetID);
+-
+-        if (
+-            iSTBL_PT1_AssetOracle(AssetData.oracle).fetchForwardPrice(
+-                VaultData.assetDepositNet
+-            ) < (VaultData.depositValueUSD)
+-        )
+-            revert STBL_Asset_InsufficientVaultValue(
+-                iSTBL_PT1_AssetOracle(AssetData.oracle).fetchForwardPrice(
+-                    VaultData.assetDepositNet
+-                ),
+-                VaultData.depositValueUSD
+-            );
+-
+-        uint256 withdrawfeeAmount = calculateWithdrawFees(
+-            MetaData,
+-            AssetData.withdrawFees
+-        );
+-
+-        /** Calculate Withdraw asset value */
+-        uint256 withdrawAssetValue = iSTBL_PT1_AssetOracle(AssetData.oracle)
+-            .fetchInversePrice(
+-                ((MetaData.stableValueNet + MetaData.haircutAmount) -
+-                    withdrawfeeAmount)
+-            );
+-
+-        uint256 withdrawFeeAssetValue = iSTBL_PT1_AssetOracle(AssetData.oracle)
+-            .fetchInversePrice(withdrawfeeAmount);
+-
+-        /** Transfer Asset outward post decimal conversion */
+-        IERC20(AssetData.token).safeTransfer(
+-            _to,
+-            withdrawAssetValue.convertFrom18Decimals(
+-                DecimalConverter.getTokenDecimals(AssetData.token)
+-            )
+-        );
+-
+-        /** Deduct Withdraw fees */
+-        VaultData.withdrawFees += withdrawFeeAssetValue;
+-
+-        /** Deduct USD Value Withdrawn */
+-        VaultData.depositValueUSD -=
+-            MetaData.stableValueNet +
+-            MetaData.haircutAmount;
+-
+-        /** Deduct Hair Cut values */
+-        VaultData.cumilativeHairCutValue -= MetaData
+-            .haircutAmount; /** look at this in depth */
+-
+-        /** */
+-        VaultData.assetDepositNet -= (withdrawAssetValue +
+-            withdrawFeeAssetValue);
+-        VaultData.assetDepositGross -= MetaData.assetValue;
+-
+-        emit withdrawEvent(
+-            AssetData.token,
+-            _to,
+-            withdrawAssetValue,
+-            withdrawfeeAmount,
+-            withdrawFeeAssetValue,
+-            MetaData.haircutAmount
+-        );
+-    }
+-
+-    /**
+-     * @notice Calculates potential yield based on asset price appreciation vs tracked USD value
+-     * @dev Internal function comparing current oracle-based USD value against historical deposit tracking
+-     * @dev Returns positive differential when current asset value exceeds tracked USD deposits
+-     * @return Price differential in USD (18 decimals) representing available yield, or 0 if no appreciation
+-     */
+-    function iCalculatePriceDifferentiation() internal view returns (uint256) {
+-        AssetDefinition memory AssetData = registry.fetchAssetData(assetID);
+-
+-        uint256 USDValueOfDepositValue = iSTBL_PT1_AssetOracle(AssetData.oracle)
+-            .fetchForwardPrice(VaultData.assetDepositNet);
+-
+-        if (USDValueOfDepositValue > VaultData.depositValueUSD) {
+-            return USDValueOfDepositValue - VaultData.depositValueUSD;
+-        } else {
+-            return (0);
+-        }
+-    }
+-
+-    /**
+-     * @notice Distributes accumulated yield from asset appreciation to protocol reward distributor
+-     * @dev Calculates yield differential, deducts protocol fees, and transfers tokens to distributor
+-     * @dev Only executes distribution when positive price differential exists
+-     * @dev Restricted to protocol treasury address for security
+-     * @custom:event YieldDistributed Emitted with yield distribution details including fees and amounts
+-     */
+-    function distributeYield() external {
+-        AssetDefinition memory AssetData = registry.fetchAssetData(assetID);
+-        uint256 differentialUSD = iCalculatePriceDifferentiation();
+-
+-        if (msg.sender != registry.fetchTreasury())
+-            revert STBL_UnauthorizedIssuer();
+-
+-        if (differentialUSD > 0) {
+-            (uint256 yield, uint256 yieldFee) = AssetData.calculateYieldFee(
+-                differentialUSD
+-            );
+-
+-            uint256 yieldFeeAssetValue = iSTBL_PT1_AssetOracle(AssetData.oracle)
+-                .fetchInversePrice(yieldFee);
+-
+-            uint256 yieldAssetValue = iSTBL_PT1_AssetOracle(AssetData.oracle)
+-                .fetchInversePrice(yield);
+-
+-            VaultData.yieldFees += yieldFeeAssetValue;
+-
+-            IERC20(AssetData.token).approve(
+-                AssetData.rewardDistributor,
+-                yieldAssetValue.convertFrom18Decimals(
+-                    DecimalConverter.getTokenDecimals(AssetData.token)
+-                )
+-            );
+-
+-            VaultData.assetDepositNet -= yieldAssetValue + yieldFeeAssetValue;
+-
+-            iSTBL_PT1_AssetYieldDistributor(AssetData.rewardDistributor)
+-                .distributeReward(
+-                    yieldAssetValue.convertFrom18Decimals(
+-                        DecimalConverter.getTokenDecimals(AssetData.token)
+-                    )
+-                );
+-
+-            emit YieldDistributed(
+-                AssetData.token,
+-                AssetData.rewardDistributor,
+-                yield,
+-                yieldFee,
+-                yieldAssetValue
+-            );
+-        }
+-    }
+-
+-    /**
+-     * @notice External view function exposing price differential calculation for yield potential
+-     * @dev Public interface to check available yield without executing distribution
+-     * @dev Used by external contracts, interfaces, and monitoring systems
+-     * @return Price differential value in USD (18 decimals) representing distributable yield
+-     */
+-    function CalculatePriceDifferentiation() external view returns (uint256) {
+-        return iCalculatePriceDifferentiation();
+-    }
+-
+-    /**
+-     * @notice Transfers all accumulated protocol fees to the designated treasury address
+-     * @dev Consolidates deposit, withdrawal, yield, and insurance fees for batch transfer
+-     * @dev Resets all fee counters to zero after successful transfer completion
+-     * @dev Validates treasury address existence before executing transfer
+-     * @custom:event FeesWithdrawn Emitted with detailed breakdown of all withdrawn fee categories
+-     */
+-    function withdrawFees() external {
+-        AssetDefinition memory AssetData = registry.fetchAssetData(assetID);
+-        address treasury = registry.fetchTreasury();
+-
+-        if (treasury == address(0)) revert STBL_InvalidTreasury();
+-
+-        /** Calculate fees Value */
+-        uint256 Fees = VaultData.depositFees +
+-            VaultData.withdrawFees +
+-            VaultData.yieldFees +
+-            VaultData.insuranceFees;
+-
+-        /** Transfer Fees Outside */
+-        IERC20(AssetData.token).safeTransfer(
+-            treasury,
+-            Fees.convertFrom18Decimals(
+-                DecimalConverter.getTokenDecimals(AssetData.token)
+-            )
+-        );
+-        emit FeesWithdrawn(
+-            treasury,
+-            VaultData.depositFees,
+-            VaultData.withdrawFees,
+-            VaultData.yieldFees,
+-            VaultData.insuranceFees,
+-            Fees
+-        );
+-
+-        /** Reset Counters */
+-        VaultData.depositFees = 0;
+-        VaultData.withdrawFees = 0;
+-        VaultData.yieldFees = 0;
+-        VaultData.insuranceFees = 0;
+-    }
+-
+-    /**
+-     * @notice Drains a specified amount of tokens from the vault to treasury during emergency situations
+-     * @dev Emergency function that transfers tokens directly to treasury when asset is disabled
+-     * @dev Can only be executed when the asset status is not ENABLED for security purposes
+-     * @dev Reduces the net asset deposit tracking by the withdrawn amount
+-     * @custom:event EmergencyFundsWithdraw Emitted with the amount of tokens withdrawn
+-     * @custom:security Only callable when asset is disabled and treasury address is valid
+-     */
+-    function emergencyWithdraw() external {
+-        AssetDefinition memory AssetData = registry.fetchAssetData(assetID);
+-        address treasury = registry.fetchTreasury();
+-
+-        if (treasury == address(0)) revert STBL_InvalidTreasury();
+-        if (AssetData.status != AssetStatus.EMERGENCY_STOP)
+-            revert STBL_AssetActive();
+-
+-        uint256 balance = IERC20(AssetData.token).balanceOf(address(this));
+-
+-        IERC20(AssetData.token).safeTransfer(treasury, balance);
+-        emit EmergencyFundsWithdraw(balance);
+-    }
+-
+-    /**
+-     * @notice Calculates withdrawal fees based on gross stable value and fee percentage
+-     * @dev Internal pure function that computes fees without modifying state
+-     * @dev Fee calculation: (stableValueGross * withdrawFee) / FEES_CONSTANT
+-     * @param MetaData Withdrawal metadata containing stable value information
+-     * @param withdrawFee Fee percentage to be applied (scaled by FEES_CONSTANT)
+-     * @return withdrawfeeAmount Calculated withdrawal fee amount in stable value units
+-     */
+-    function calculateWithdrawFees(
+-        YLD_Metadata memory MetaData,
+-        uint256 withdrawFee
+-    ) internal pure returns (uint256 withdrawfeeAmount) {
+-        withdrawfeeAmount =
+-            (MetaData.stableValueGross * withdrawFee) /
+-            FEES_CONSTANT;
+-    }
+-
+-    /**
+-     * @notice Retrieves the asset ID managed by this vault instance
+-     * @dev Returns the unique identifier for the asset type this vault handles
+-     * @return The asset ID associated with this vault
+-     */
+-    function fetchAssetID() external view returns (uint256) {
+-        return assetID;
+-    }
+-
+-    /**
+-     * @notice Retrieves the protocol registry contract address
+-     * @dev Returns the registry contract that provides system configuration and access control
+-     * @return The address of the protocol registry contract
+-     */
+-    function fetchRegistry() external view returns (address) {
+-        return address(registry);
+-    }
+-
+-    /**
+-     * @notice Retrieves the complete vault state data
+-     * @dev Returns all vault metrics including deposits, fees, yields, and tracking values
+-     * @return VaultStruct containing comprehensive vault state information
+-     */
+-    function fetchVaultData() external view returns (VaultStruct memory) {
+-        return VaultData;
+-    }
+-
+-    /**
+-     * @notice Retrieves the trusted forwarder address for ERC2771 meta-transaction support
+-     * @dev Queries registry for current trusted forwarder configuration
+-     * @dev Used by ERC2771Context to validate and process meta-transactions
+-     * @return Address of the currently configured trusted forwarder contract
+-     */
+-    function trustedForwarder() public view virtual override returns (address) {
+-        return registry.trustedForwarder();
+-    }
+-
+-    /**
+-     * @notice Resolves inheritance conflict for _msgSender() between ERC2771Context and Context
+-     * @dev Returns the actual transaction sender, accounting for meta-transaction forwarding
+-     * @dev Prioritizes ERC2771Context implementation for proper meta-transaction handling
+-     * @return Actual sender address of the current transaction
+-     */
+-    function _msgSender()
+-        internal
+-        view
+-        override(ERC2771ContextUpgradeable)
+-        returns (address)
+-    {
+-        return ERC2771ContextUpgradeable._msgSender();
+-    }
+-
+-    /**
+-     * @notice Resolves inheritance conflict for _msgData() between ERC2771Context and Context
+-     * @dev Returns the actual transaction calldata, accounting for meta-transaction forwarding
+-     * @dev Prioritizes ERC2771Context implementation for proper meta-transaction handling
+-     * @return Complete calldata of the current transaction
+-     */
+-    function _msgData()
+-        internal
+-        view
+-        override(ERC2771ContextUpgradeable)
+-        returns (bytes calldata)
+-    {
+-        return ERC2771ContextUpgradeable._msgData();
+-    }
+-
+-    /**
+-     * @notice Resolves inheritance conflict for _contextSuffixLength() in ERC2771Context
+-     * @dev Returns the length of context suffix used in meta-transaction processing
+-     * @dev Prioritizes ERC2771Context implementation for proper meta-transaction handling
+-     * @return Length of the context suffix for meta-transaction support
+-     */
+-    function _contextSuffixLength()
+-        internal
+-        view
+-        override(ERC2771ContextUpgradeable)
+-        returns (uint256)
+-    {
+-        return ERC2771ContextUpgradeable._contextSuffixLength();
+-    }
+-}
+diff -ruN sources/STBL_PT1_Vault-OUSG//prior/contracts/Assets/PT1/interfaces/ISTBL_PT1_AssetIssuer.sol sources/STBL_PT1_Vault-OUSG//current/contracts/Assets/PT1/interfaces/ISTBL_PT1_AssetIssuer.sol
+--- sources/STBL_PT1_Vault-OUSG//prior/contracts/Assets/PT1/interfaces/ISTBL_PT1_AssetIssuer.sol	2026-09-24 23:43:10
++++ sources/STBL_PT1_Vault-OUSG//current/contracts/Assets/PT1/interfaces/ISTBL_PT1_AssetIssuer.sol	1969-12-31 21:00:00
+@@ -1,106 +0,0 @@
+-// SPDX-License-Identifier: MIT
+-pragma solidity ^0.8.20;
+-
+-import "../../../lib/STBL_Structs.sol";
+-
+-/**
+- * @title STBL Asset Issuer Interface
+- * @notice Interface for handling the issuance and redemption of stable assets in the Pi Protocol
+- * @dev Acts as an intermediary between users and the protocol's core components for asset management
+- */
+-interface iSTBL_PT1_AssetIssuer {
+-    /**
+-     * @notice Emitted when an asset is deposited into the protocol
+-     * @dev Contains detailed information about the deposit transaction and minted NFT
+-     * @param user Address of the user making the deposit
+-     * @param _tokenID Unique identifier of the NFT minted to represent the deposited asset
+-     * @param _MetaData Metadata structure containing comprehensive details about the deposited asset
+-     */
+-    event depositAsset(
+-        address indexed user,
+-        uint256 _tokenID,
+-        YLD_Metadata _MetaData
+-    );
+-
+-    /**
+-     * @notice Emitted when an asset is withdrawn from the protocol
+-     * @dev Triggered when a user burns their NFT to withdraw the underlying asset
+-     * @param user Address of the user withdrawing the asset
+-     * @param _tokenID ID of the NFT being burned during the withdrawal process
+-     * @param _MetaData Metadata structure containing details about the withdrawn asset
+-     */
+-    event withdrawAsset(
+-        address indexed user,
+-        uint256 _tokenID,
+-        YLD_Metadata _MetaData
+-    );
+-
+-    /**
+-     * @notice Emitted when an asset is withdrawn from the protocol treasury
+-     * @dev Used for administrative or treasury-related asset withdrawals
+-     * @param user Address of the user or admin withdrawing the asset from treasury
+-     * @param _tokenID ID of the NFT burned during the treasury withdrawal operation
+-     * @param _MetaData Metadata structure containing comprehensive details about the withdrawn asset
+-     */
+-    event withdrawAssetTreasury(
+-        address indexed user,
+-        uint256 _tokenID,
+-        YLD_Metadata _MetaData
+-    );
+-
+-    /**
+-     * @notice Emitted when the contract implementation is upgraded
+-     * @dev Triggered during an upgrade of the contract to a new implementation
+-     * @param newImplementation Address of the new implementation contract
+-     */
+-    event ContractUpgraded(address newImplementation);
+-
+-    /**
+-     * @notice Deposits real-world assets and mints a yield-bearing NFT to the caller
+-     * @dev Wrapper function that calls iDeposit with the message sender as the recipient
+-     * @param assetValue Amount of assets to deposit, specified in the asset's native decimal precision
+-     * @return nftID The unique identifier of the minted NFT that represents ownership of the deposited assets
+-     */
+-    function deposit(uint256 assetValue) external returns (uint256);
+-
+-    /**
+-     * @notice Deposits real-world assets and mints a yield-bearing NFT to a specified sender
+-     * @dev Wrapper function that calls iDeposit with a custom sender address
+-     * @param assetValue Amount of assets to deposit, specified in the asset's native decimal precision
+-     * @param _sender The address that will receive the ownership NFT
+-     * @return nftID The unique identifier of the minted NFT that represents ownership of the deposited assets
+-     */
+-    function deposit(
+-        uint256 assetValue,
+-        address _sender
+-    ) external returns (uint256);
+-
+-    /**
+-     * @notice Withdraws deposited assets by burning the caller's yield-bearing NFT
+-     * @dev Wrapper function that calls iWithdraw with the message sender as the owner
+-     * @param _tokenID The unique identifier of the NFT to burn in exchange for withdrawing the underlying assets
+-     */
+-    function withdraw(uint256 _tokenID) external;
+-
+-    /**
+-     * @notice Withdraws deposited assets by burning a specified sender's yield-bearing NFT
+-     * @dev Wrapper function that calls iWithdraw with a custom sender address
+-     * @param _tokenID The unique identifier of the NFT to burn in exchange for withdrawing the underlying assets
+-     * @param _sender The address of the account withdrawing assets
+-     */
+-    function withdraw(uint256 _tokenID, address _sender) external;
+-
+-    /**
+-     * @notice Retrieves the asset ID managed by this vault instance
+-     * @dev Returns the unique identifier for the asset type this vault handles
+-     * @return The asset ID associated with this vault
+-     */
+-    function fetchAssetID() external view returns (uint256);
+-
+-    /**
+-     * @notice Retrieves the protocol registry contract address
+-     * @dev Returns the registry contract that provides system configuration and access control
+-     * @return The address of the protocol registry contract
+-     */
+-    function fetchRegistry() external view returns (address);
+-}
+diff -ruN sources/STBL_PT1_Vault-OUSG//prior/contracts/Assets/PT1/interfaces/ISTBL_PT1_AssetOracle.sol sources/STBL_PT1_Vault-OUSG//current/contracts/Assets/PT1/interfaces/ISTBL_PT1_AssetOracle.sol
+--- sources/STBL_PT1_Vault-OUSG//prior/contracts/Assets/PT1/interfaces/ISTBL_PT1_AssetOracle.sol	2026-09-24 23:43:10
++++ sources/STBL_PT1_Vault-OUSG//current/contracts/Assets/PT1/interfaces/ISTBL_PT1_AssetOracle.sol	1969-12-31 21:00:00
+@@ -1,60 +0,0 @@
+-// SPDX-License-Identifier: MIT
+-pragma solidity ^0.8.20;
+-
+-/**
+- * @title STBL Asset Price Oracle Interface
+- * @notice Interface for retrieving asset price information in the STBL protocol
+- * @dev This interface defines the standard methods for price oracles used by the STBL system
+- */
+-interface iSTBL_PT1_AssetOracle {
+-    /** @notice Emitted when the oracle is enabled
+-     */
+-    event oracleEnabled();
+-
+-    /** @notice Emitted when the oracle is disabled
+-     */
+-    event oracleDisabled();
+-
+-    /** @notice Emitted when the oracle decimals are set
+-     * @param _decimals The number of decimals set for price representation
+-     */
+-    event oracleSetDecimals(uint256 _decimals);
+-
+-    /** @notice Emitted when the oracle price threshold is set
+-     * @param _threshold The price threshold that was set
+-     */
+-    event oracleSetPriceThreshold(uint256 _threshold);
+-
+-    /** @notice Enables the oracle
+-     * @dev Only admin can call this function
+-     */
+-    function enableOracle() external;
+-
+-    /** @notice Disables the oracle
+-     * @dev Only admin can call this function
+-     */
+-    function disableOracle() external;
+-
+-    /** @notice Sets the number of decimals for price representation
+-     * @param _decimals The number of decimals to be used for price representation
+-     * @dev Only admin can call this function
+-     */
+-    function setPriceDecimals(uint256 _decimals) external;
+-
+-    /** @notice Sets the price threshold
+-     * @param _threshold The price threshold to be set
+-     * @dev Only admin can call this function
+-     */
+-    function setPriceThreshold(uint256 _threshold) external;
+-
+-    /** @notice Gets the number of decimals for the price
+-     * @return The number of decimals used for price representation (8 decimals)
+-     */
+-    function getPriceDecimals() external view returns (uint256);
+-
+-    /** @notice Retrieves the current price of the USDY asset
+-     * @return price The current price of the USDY asset with 8 decimal precision
+-     * @dev Returns the stored price value for the USDY asset
+-     */
+-    function fetchPrice() external view returns (uint256);
+-}
+diff -ruN sources/STBL_PT1_Vault-OUSG//prior/contracts/Assets/PT1/interfaces/ISTBL_PT1_AssetVault.sol sources/STBL_PT1_Vault-OUSG//current/contracts/Assets/PT1/interfaces/ISTBL_PT1_AssetVault.sol
+--- sources/STBL_PT1_Vault-OUSG//prior/contracts/Assets/PT1/interfaces/ISTBL_PT1_AssetVault.sol	2026-09-24 23:43:10
++++ sources/STBL_PT1_Vault-OUSG//current/contracts/Assets/PT1/interfaces/ISTBL_PT1_AssetVault.sol	1969-12-31 21:00:00
+@@ -1,164 +0,0 @@
+-// SPDX-License-Identifier: MIT
+-pragma solidity ^0.8.20;
+-
+-import "../../../lib/STBL_Structs.sol";
+-
+-/**
+- * @title Asset Vault Interface
+- * @notice Manages the secure storage and handling of assets in the Pi Protocol
+- * @dev Implements access control for asset custody and yield distribution
+- */
+-interface iSTBL_PT1_AssetVault {
+-    /**
+-     * @notice Emitted when tokens are deposited into the vault
+-     * @param _token Address of the ERC20 token being deposited
+-     * @param _from Address sending the tokens into the vault
+-     * @param _depositValue Total amount of tokens deposited
+-     * @param _depositFee Fee charged on the deposit transaction
+-     * @param _hairCut Percentage reduction applied to deposit value
+-     * @param _insuranceFee Additional fee for insurance protection
+-     * @param _depositFeesAssetValue Asset value of the deposit fee amount
+-     * @param _insuranceFeeAssetValue Asset value of the insurance fee amount
+-     */
+-    event depositEvent(
+-        address _token,
+-        address _from,
+-        uint256 _depositValue,
+-        uint256 _depositFee,
+-        uint256 _insuranceFee,
+-        uint256 _hairCut,
+-        uint256 _depositFeesAssetValue,
+-        uint256 _insuranceFeeAssetValue
+-    );
+-
+-    /**
+-     * @notice Emitted when tokens are withdrawn from the vault
+-     * @param _token Address of the ERC20 token being withdrawn
+-     * @param _to Address receiving the tokens from the vault
+-     * @param _netValue Net amount of tokens withdrawn after fees and haircuts
+-     * @param _withdrawFee Fee charged on the withdrawal transaction
+-     * @param _withdrawFeeAssetValue Asset value of the withdrawal fee amount
+-     * @param _hairCut Percentage reduction applied to withdrawal value
+-     */
+-    event withdrawEvent(
+-        address _token,
+-        address _to,
+-        uint256 _netValue,
+-        uint256 _withdrawFee,
+-        uint256 _withdrawFeeAssetValue,
+-        uint256 _hairCut
+-    );
+-
+-    /**
+-     * @notice Emitted when yield is distributed to participants
+-     * @param token Address of the ERC20 token for which yield is distributed
+-     * @param distributor Address that initiated the yield distribution
+-     * @param netYield Net amount of yield distributed to participants
+-     * @param yieldFee Fee charged on the yield distribution
+-     * @param yieldValue Total gross yield value before fees
+-     */
+-    event YieldDistributed(
+-        address indexed token,
+-        address indexed distributor,
+-        uint256 netYield,
+-        uint256 yieldFee,
+-        uint256 yieldValue
+-    );
+-
+-    /**
+-     * @notice Event emitted when deposit, withdrawal, yield, and insurance fees are withdrawn to treasury
+-     * @param treasury Address where token fees are withdrawn
+-     * @param depositFees Total amount of deposit fees withdrawn
+-     * @param withdrawFees Total amount of withdrawal fees withdrawn
+-     * @param yieldFees Total amount of yield fees withdrawn
+-     * @param insuranceFees Total amount of insurance fees withdrawn
+-     * @param Fees Total Fees priced in asset value
+-     */
+-    event FeesWithdrawn(
+-        address indexed treasury,
+-        uint256 depositFees,
+-        uint256 withdrawFees,
+-        uint256 yieldFees,
+-        uint256 insuranceFees,
+-        uint256 Fees
+-    );
+-
+-    /**
+-     * @notice Emitted when emergency funds are withdrawn from the vault
+-     * @param _amt Amount of funds withdrawn during the emergency procedure
+-     */
+-    event EmergencyFundsWithdraw(uint256 _amt);
+-
+-    /**
+-     * @notice Emitted when the contract implementation is upgraded
+-     * @dev Triggered during an upgrade of the contract to a new implementation
+-     * @param newImplementation Address of the new implementation contract
+-     */
+-    event ContractUpgraded(address newImplementation);
+-
+-    /**
+-     * @notice Handles secure ERC20 token deposits into the asset vault
+-     * @dev Validates and processes token deposits with metadata containing fee and haircut information
+-     * @param _from Address initiating the token deposit
+-     * @param MetaData Structured data containing deposit value, fees, haircuts and other token metadata
+-     */
+-    function depositERC20(address _from, YLD_Metadata memory MetaData) external;
+-
+-    /**
+-     * @notice Handles ERC20 token withdrawals from the vault
+-     * @dev Only callable by the valid issuer
+-     * @param _to Address to receive the tokens
+-     * @param MetaData Structured data containing withdrawal details including value, fees, and haircuts
+-     */
+-    function withdrawERC20(address _to, YLD_Metadata memory MetaData) external;
+-
+-    /**
+-     * @notice Distributes accumulated yield to vault participants
+-     * @dev Calculates and distributes yield based on predefined protocols
+-     */
+-    function distributeYield() external;
+-
+-    /**
+-     * @notice Calculates the price differentiation for the asset
+-     * @dev Computes the price variance or spread for the asset under management
+-     * @return The calculated price differentiation metric
+-     */
+-    function CalculatePriceDifferentiation() external view returns (uint256);
+-
+-    /**
+-     * @notice Withdraws accumulated protocol fees to the treasury
+-     * @dev Transfers accumulated fees from deposit, withdrawal, and other sources
+-     */
+-    function withdrawFees() external;
+-
+-    /**
+-     * @notice Drains a specified amount of tokens from the vault to treasury during emergency situations
+-     * @dev Emergency function that transfers tokens directly to treasury when asset is disabled
+-     * @dev Can only be executed when the asset status is not ENABLED for security purposes
+-     * @dev Reduces the net asset deposit tracking by the withdrawn amount
+-     * @custom:event EmergencyFundsWithdraw Emitted with the amount of tokens withdrawn
+-     * @custom:security Only callable when asset is disabled and treasury address is valid
+-     */
+-    function emergencyWithdraw() external;
+-
+-    /**
+-     * @notice Retrieves the asset ID managed by this vault instance
+-     * @dev Returns the unique identifier for the asset type this vault handles
+-     * @return The asset ID associated with this vault
+-     */
+-    function fetchAssetID() external view returns (uint256);
+-
+-    /**
+-     * @notice Retrieves the protocol registry contract address
+-     * @dev Returns the registry contract that provides system configuration and access control
+-     * @return The address of the protocol registry contract
+-     */
+-    function fetchRegistry() external view returns (address);
+-
+-    /**
+-     * @notice Retrieves the complete vault state data
+-     * @dev Returns all vault metrics including deposits, fees, yields, and tracking values
+-     * @return VaultStruct containing comprehensive vault state information
+-     */
+-    function fetchVaultData() external view returns (VaultStruct memory);
+-}
+diff -ruN sources/STBL_PT1_Vault-OUSG//prior/contracts/Assets/PT1/interfaces/ISTBL_PT1_AssetYieldDistributor.sol sources/STBL_PT1_Vault-OUSG//current/contracts/Assets/PT1/interfaces/ISTBL_PT1_AssetYieldDistributor.sol
+--- sources/STBL_PT1_Vault-OUSG//prior/contracts/Assets/PT1/interfaces/ISTBL_PT1_AssetYieldDistributor.sol	2026-09-24 23:43:10
++++ sources/STBL_PT1_Vault-OUSG//current/contracts/Assets/PT1/interfaces/ISTBL_PT1_AssetYieldDistributor.sol	1969-12-31 21:00:00
+@@ -1,103 +0,0 @@
+-// SPDX-License-Identifier: MIT
+-pragma solidity ^0.8.20;
+-
+-import "../../../lib/STBL_Structs.sol";
+-
+-/**
+- * @title STBL Asset Yield Distributor Interface
+- * @notice Interface for managing reward distribution for staked assets in the STBL Protocol
+- * @dev Defines the contract interface for reward calculation, distribution, and tracking for yield-bearing assets
+- * @author STBL Protocol Team
+- */
+-interface iSTBL_PT1_AssetYieldDistributor {
+-    /**
+-     * @notice Emitted when rewards are distributed to all stakers
+-     * @param amount The total amount of rewards distributed
+-     */
+-    event RewardDistributed(uint256 amount);
+-
+-    /**
+-     * @notice Emitted when staking is enabled for a specific token
+-     * @param id The token ID for which staking is enabled
+-     * @param amount The amount being staked
+-     */
+-    event StakingEnabled(uint256 indexed id, uint256 amount);
+-
+-    /**
+-     * @notice Emitted when staking is disabled for a specific token
+-     * @param id The token ID for which staking is disabled
+-     * @param amount The amount being unstaked
+-     */
+-    event StakingDisabled(uint256 indexed id, uint256 amount);
+-
+-    /**
+-     * @notice Emitted when rewards are claimed by a token holder
+-     * @param tokenId The token ID for which rewards are claimed
+-     * @param amount The amount of rewards claimed
+-     */
+-    event RewardClaimed(uint256 indexed tokenId, uint256 amount);
+-
+-    /**
+-     * @notice Emitted when the contract implementation is upgraded
+-     * @dev Triggered during an upgrade of the contract to a new implementation
+-     * @param newImplementation Address of the new implementation contract
+-     */
+-    event ContractUpgraded(address newImplementation);
+-
+-    /**
+-     * @notice Distributes rewards proportionally to all active stakers
+-     * @param reward The total amount of rewards to distribute
+-     * @dev Can only be called by the authorized vault contract
+-     * @dev Updates the global reward per token accumulated value
+-     */
+-    function distributeReward(uint256 reward) external;
+-
+-    /**
+-     * @notice Calculates the total unclaimed rewards for a specific token ID
+-     * @param id The token ID to calculate rewards for
+-     * @return The total amount of rewards earned but not yet claimed
+-     * @dev Returns 0 if the token is not currently staking or has no rewards
+-     */
+-    function calculateRewardsEarned(uint256 id) external view returns (uint256);
+-
+-    /**
+-     * @notice Enables staking for a token ID with specified stake amount
+-     * @param id The token ID to enable staking for
+-     * @param value The amount to stake for this token
+-     * @dev Can only be called by the authorized issuer contract
+-     * @dev Updates the token's staking status and begins reward accumulation
+-     */
+-    function enableStaking(uint256 id, uint256 value) external;
+-
+-    /**
+-     * @notice Disables staking for a token ID and unstakes specified amount
+-     * @param id The token ID to disable staking for
+-     * @param value The amount to unstake
+-     * @dev Can only be called by the authorized issuer contract
+-     * @dev Automatically claims any pending rewards before disabling
+-     */
+-    function disableStaking(uint256 id, uint256 value) external;
+-
+-    /**
+-     * @notice Claims all accumulated rewards for a specific token ID
+-     * @param id The token ID to claim rewards for
+-     * @return The amount of rewards claimed and transferred
+-     * @dev Can only be called by the token owner or authorized operator
+-     * @dev Resets the reward counter for the token after claiming
+-     */
+-    function claim(uint256 id) external returns (uint256);
+-
+-    /**
+-     * @notice Retrieves the asset ID managed by this vault instance
+-     * @dev Returns the unique identifier for the asset type this vault handles
+-     * @return The asset ID associated with this vault
+-     */
+-    function fetchAssetID() external view returns (uint256);
+-
+-    /**
+-     * @notice Retrieves the protocol registry contract address
+-     * @dev Returns the registry contract that provides system configuration and access control
+-     * @return The address of the protocol registry contract
+-     */
+-    function fetchRegistry() external view returns (address);
+-}
+diff -ruN sources/STBL_PT1_Vault-OUSG//prior/contracts/Assets/PT1/lib/STBL_OracleLib.sol sources/STBL_PT1_Vault-OUSG//current/contracts/Assets/PT1/lib/STBL_OracleLib.sol
+--- sources/STBL_PT1_Vault-OUSG//prior/contracts/Assets/PT1/lib/STBL_OracleLib.sol	2026-09-24 23:43:10
++++ sources/STBL_PT1_Vault-OUSG//current/contracts/Assets/PT1/lib/STBL_OracleLib.sol	1969-12-31 21:00:00
+@@ -1,44 +0,0 @@
+-// SPDX-License-Identifier: MIT
+-pragma solidity ^0.8.20;
+-
+-import "../../../lib/STBL_Structs.sol";
+-
+-import "../interfaces/ISTBL_PT1_AssetOracle.sol";
+-
+-/**
+- * @title Oracle Library Functions
+- * @notice Library providing utility functions for asset oracle price calculations
+- * @dev Contains functions for forward and inverse price calculations using oracle data
+- */
+-library STBL_OracleLib {
+-    /**
+-     * @notice Fetches and calculates forward price from oracle contract
+-     * @dev Multiplies oracle price by amount and adjusts for price decimals
+-     * @param oracle The oracle contract implementing iSTBL_AssetOracle interface
+-     * @param amount The amount to calculate price for (in token units)
+-     * @return forwardPrice Calculated forward price adjusted for oracle decimals
+-     */
+-    function fetchForwardPrice(
+-        iSTBL_PT1_AssetOracle oracle,
+-        uint256 amount
+-    ) internal view returns (uint256 forwardPrice) {
+-        forwardPrice = ((oracle.fetchPrice() * amount) /
+-            (10 ** oracle.getPriceDecimals()));
+-    }
+-
+-    /**
+-     * @notice Fetches and calculates inverse price from oracle contract
+-     * @dev Divides amount by oracle price and adjusts for price decimals
+-     * @param oracle The oracle contract implementing iSTBL_AssetOracle interface
+-     * @param amount The amount to calculate inverse price for (in token units)
+-     * @return inversePrice Calculated inverse price adjusted for oracle decimals
+-     */
+-    function fetchInversePrice(
+-        iSTBL_PT1_AssetOracle oracle,
+-        uint256 amount
+-    ) internal view returns (uint256 inversePrice) {
+-        inversePrice =
+-            (amount * (10 ** oracle.getPriceDecimals())) /
+-            oracle.fetchPrice();
+-    }
+-}
+diff -ruN sources/STBL_PT1_Vault-OUSG//prior/contracts/Assets/PT1/lib/STBL_PT1_Asset_Errors.sol sources/STBL_PT1_Vault-OUSG//current/contracts/Assets/PT1/lib/STBL_PT1_Asset_Errors.sol
+--- sources/STBL_PT1_Vault-OUSG//prior/contracts/Assets/PT1/lib/STBL_PT1_Asset_Errors.sol	2026-09-24 23:43:10
++++ sources/STBL_PT1_Vault-OUSG//current/contracts/Assets/PT1/lib/STBL_PT1_Asset_Errors.sol	1969-12-31 21:00:00
+@@ -1,85 +0,0 @@
+-// SPDX-License-Identifier: MIT
+-pragma solidity ^0.8.20;
+-
+-/**
+- * @notice Thrown when the asset setup is not complete or inactive
+- * @param id The ID of the asset that is not properly setup
+- */
+-error STBL_Asset_SetupNotComplete(uint256 id);
+-
+-/**
+- * @notice Thrown when an unauthorized issuer attempts an operation
+- * @dev Used in the isValidIssuer modifier to restrict access
+- * @param id The ID of the asset with the invalid issuer
+- */
+-error STBL_Asset_InvalidIssuer(uint256 id);
+-
+-/**
+- * @notice Thrown when the calling address is not the valid vault contract
+- * @param id The ID of the asset with the invalid vault address
+- */
+-error STBL_Asset_InvalidVault(uint256 id);
+-
+-/**
+- * @notice Thrown when attempting to interact with an invalid asset
+- * @param id The ID of the invalid asset
+- */
+-error STBL_Asset_InvalidAsset(uint256 id);
+-
+-/**
+- * @notice Thrown when the provided owner does not match the expected owner
+- * @param _tokenID The token ID for which withdrawal was attempted too early
+- * @param owner The owner ID that was provided but is incorrect
+- */
+-error STBL_Asset_IncorrectOwner(uint256 _tokenID, address owner);
+-
+-/**
+- * @notice Thrown when attempting to call a function before contract initialization
+- * @param id The ID of the uninitialized asset
+- */
+-error STBL_Asset_NotInitialized(uint256 id);
+-
+-/**
+- * @notice Thrown when attempting to initialize an already initialized asset
+- * @param id The ID of the asset that is already initialized
+- */
+-error STBL_Asset_Initialized(uint256 id);
+-
+-/**
+- * @notice Thrown when attempting to withdraw before the required duration has passed
+- * @param id The ID of the asset where early withdrawal was attempted
+- * @param _tokenID The token ID for which withdrawal was attempted too early
+- */
+-error STBL_Asset_WithdrawDurationNotReached(uint256 id, uint256 _tokenID);
+-
+-/**
+- * @notice Thrown when attempting to claim yield before the required duration has passed
+- * @param id The ID of the asset where early yield claim was attempted
+- * @param duration The required duration that must be satisfied before claiming yield
+- */
+-error STBL_Asset_YieldDurationNotReached(uint256 id, uint256 duration);
+-
+-/**
+- * @notice Thrown when the vault value is insufficient compared to the asset value
+- * @param _assetValue The current asset value that is being compared
+- * @param _usdValue The USD value that is insufficient for the operation
+- */
+-error STBL_Asset_InsufficientVaultValue(uint256 _assetValue, uint256 _usdValue);
+-
+-/**
+- * @notice Thrown when an invalid deposit amount is provided
+- * @param assetID The ID of the asset for which the invalid deposit was attempted
+- * @param amount The invalid deposit amount that was provided
+- */
+-error STBL_Asset_InvalidDepositAmount(uint256 assetID, uint256 amount);
+-/**
+- * @notice Thrown when the oracle price is stale or outdated
+- * @param price The stale price value returned by the oracle
+- * @param time The timestamp when the stale price was last updated
+- */
+-error STBL_Asset_OracleStalePrice(uint256 price, uint256 time);
+-
+-/**
+- * @notice Thrown when the oracle is disabled or not available
+- */
+-error STBL_Asset_OracleDisabled();
+diff -ruN sources/STBL_PT1_Vault-OUSG//prior/contracts/asset/PT1/STBL_PT1_Vault.sol sources/STBL_PT1_Vault-OUSG//current/contracts/asset/PT1/STBL_PT1_Vault.sol
+--- sources/STBL_PT1_Vault-OUSG//prior/contracts/asset/PT1/STBL_PT1_Vault.sol	1969-12-31 21:00:00
++++ sources/STBL_PT1_Vault-OUSG//current/contracts/asset/PT1/STBL_PT1_Vault.sol	2026-09-24 23:43:09
+@@ -0,0 +1,503 @@
++// SPDX-License-Identifier: MIT
++pragma solidity ^0.8.20;
++
++import "@openzeppelin/contracts-upgradeable/metatx/ERC2771ContextUpgradeable.sol";
++import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
++import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
++
++import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
++import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
++
++import "@stbl-protocol/stbl-contracts-evm-core/contracts/interfaces/ISTBL_Register.sol";
++import "@stbl-protocol/stbl-contracts-evm-core/contracts/interfaces/ISTBL_Core.sol";
++
++import "./interfaces/ISTBL_PT1_AssetIssuer.sol";
++import "./interfaces/ISTBL_PT1_AssetVault.sol";
++import "./interfaces/ISTBL_PT1_AssetYieldDistributor.sol";
++import "./interfaces/ISTBL_PT1_AssetOracle.sol";
++
++import "@stbl-protocol/stbl-contracts-evm-core/contracts/lib/STBL_AssetDefinitionLib.sol";
++import "@stbl-protocol/stbl-contracts-evm-core/contracts/lib/STBL_Structs.sol";
++import "@stbl-protocol/stbl-contracts-evm-core/contracts/lib/STBL_Errors.sol";
++import "@stbl-protocol/stbl-contracts-evm-core/contracts/lib/STBL_DecimalConverter.sol";
++
++import "./lib/STBL_OracleLib.sol";
++import "./lib/STBL_PT1_Asset_Errors.sol";
++
++/**
++ * @title STBL Protocol Type 1 Asset Vault
++ * @notice Manages secure storage, deposits, withdrawals, and yield distribution for protocol assets
++ * @dev Upgradeable vault contract implementing ERC2771 meta-transaction support with comprehensive fee tracking
++ * @dev Handles asset custody operations including deposits, withdrawals, yield calculations, and fee management
++ * @author STBL Protocol Team
++ * @custom:version 1.0.0
++ * @custom:security-contact security@stblprotocol.com
++ */
++contract STBL_PT1_Vault is
++    Initializable,
++    iSTBL_PT1_AssetVault,
++    ERC2771ContextUpgradeable,
++    UUPSUpgradeable
++{
++    using SafeERC20 for IERC20;
++    using STBL_AssetDefinitionLib for AssetDefinition;
++    using STBL_OracleLib for iSTBL_PT1_AssetOracle;
++    using DecimalConverter for uint256;
++
++    /** @notice Role identifier for contract upgrade authorization */
++    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
++
++    /** @notice Role identifier for Yield Distribution authorization */
++    bytes32 public constant YIELD_DISTRIBUTION_ROLE =
++        keccak256("YIELD_DISTRIBUTION_ROLE");
++
++    /** @notice Current implementation version for upgrade tracking */
++    uint256 private _version;
++
++    /** @notice Protocol registry contract providing system configuration and access control */
++    iSTBL_Register private registry;
++
++    /** @notice Unique identifier for the asset type managed by this vault instance */
++    uint256 private assetID;
++
++    /** @notice Complete vault state including deposits, fees, yields, and tracking metrics */
++    VaultStruct private VaultData;
++
++    /** @dev Reserved storage slots for future contract upgrades (60 slots = 1920 bytes) */
++    uint256[60] private __gap;
++
++    /**
++     * @notice Validates that the caller is an authorized issuer for the managed asset
++     * @dev Queries registry for asset definition and verifies issuer permissions
++     * @dev Reverts with STBL_Asset_InvalidIssuer if authorization fails
++     */
++    modifier isValidIssuer() {
++        AssetDefinition memory AssetData = registry.fetchAssetData(assetID);
++        if (!AssetData.isIssuer(msg.sender))
++            revert STBL_Asset_InvalidIssuer(assetID);
++        _;
++    }
++
++    /**
++     * @notice Initializes the contract implementation without setting up state
++     * @dev Constructor for upgradeable contracts - actual initialization happens in initialize()
++     * @dev Sets up ERC2771Context with zero address (forwarder set later via registry)
++     * @custom:oz-upgrades-unsafe-allow constructor
++     */
++    constructor() ERC2771ContextUpgradeable(address(0)) {}
++
++    /**
++     * @notice Initializes the vault with asset ID and registry configuration
++     * @dev Sets up access control, UUPS upgradeability, and associates vault with specific asset
++     * @dev Can only be called once during proxy deployment
++     * @param _id Unique identifier of the asset this vault will manage
++     * @param _registry Address of the protocol registry containing system configuration
++     */
++    function initialize(uint256 _id, address _registry) public initializer {
++        __UUPSUpgradeable_init();
++
++        registry = iSTBL_Register(_registry);
++        assetID = _id;
++    }
++
++    /**
++     * @notice Authorizes contract upgrades for addresses with UPGRADER_ROLE
++     * @dev Validates upgrade permissions through registry and increments version counter
++     * @dev Required by UUPS proxy pattern for upgrade authorization
++     * @param newImplementation Address of the new implementation contract to upgrade to
++     */
++    function _authorizeUpgrade(address newImplementation) internal override {
++        if (!registry.hasRole(UPGRADER_ROLE, _msgSender()))
++            revert STBL_UnauthorizedCaller();
++        _version = _version + 1;
++        emit ContractUpgraded(newImplementation);
++    }
++
++    /**
++     * @notice Returns the current contract implementation version
++     * @dev Version increments with each successful upgrade for tracking purposes
++     * @return Current version number of the contract implementation
++     */
++    function version() external view returns (uint256) {
++        return _version;
++    }
++
++    /**
++     * @notice Processes ERC20 token deposits into the vault with comprehensive fee tracking
++     * @dev Transfers tokens from depositor, calculates fees using oracle pricing, and updates vault state
++     * @dev Records gross/net deposits, USD values, and fee breakdowns with decimal conversion
++     * @dev Only callable by authorized asset issuers
++     * @param _from Address of the depositor providing the tokens
++     * @param MetaData Comprehensive deposit information including amounts, fees, and haircuts
++     * @custom:event depositEvent Emitted with complete deposit details including fee calculations
++     */
++    function depositERC20(
++        address _from,
++        YLD_Metadata memory MetaData
++    ) external isValidIssuer {
++        AssetDefinition memory AssetData = registry.fetchAssetData(assetID);
++
++        IERC20(AssetData.token).safeTransferFrom(
++            _from,
++            address(this),
++            MetaData.assetValue.convertFrom18Decimals(
++                DecimalConverter.getTokenDecimals(AssetData.token)
++            )
++        );
++
++        uint256 depositFeesAssetValue = iSTBL_PT1_AssetOracle(AssetData.oracle)
++            .fetchInversePrice(MetaData.depositfeeAmount);
++        uint256 insuranceFeeAssetValue = iSTBL_PT1_AssetOracle(AssetData.oracle)
++            .fetchInversePrice(MetaData.insurancefeeAmount);
++
++        /** Store asset Values gross and net */
++        VaultData.assetDepositGross += MetaData.assetValue;
++        VaultData.assetDepositNet += (MetaData.assetValue -
++            (depositFeesAssetValue + insuranceFeeAssetValue));
++
++        /** Aggregate Stable Value distributed */
++        VaultData.depositValueUSD +=
++            MetaData.stableValueNet +
++            MetaData.haircutAmount;
++
++        /** Aggregate fees Values added */
++        VaultData.depositFees += depositFeesAssetValue;
++        VaultData.insuranceFees += insuranceFeeAssetValue;
++
++        /** Aggregate haircut Values added */
++        VaultData.cumilativeHairCutValue += MetaData.haircutAmount;
++
++        emit depositEvent(
++            AssetData.token,
++            _from,
++            MetaData.assetValue,
++            MetaData.depositfeeAmount,
++            MetaData.insurancefeeAmount,
++            MetaData.haircutAmount,
++            depositFeesAssetValue,
++            insuranceFeeAssetValue
++        );
++    }
++
++    /**
++     * @notice Processes ERC20 token withdrawals from the vault with fee deduction and state updates
++     * @dev Calculates withdrawal amounts using oracle pricing, applies fees, and transfers tokens
++     * @dev Updates vault balances by reducing deposits, USD tracking, and haircut values
++     * @dev Only callable by authorized asset issuers
++     * @param _to Address that will receive the withdrawn tokens
++     * @param MetaData Comprehensive withdrawal information including amounts, fees, and haircuts
++     * @custom:event withdrawEvent Emitted with complete withdrawal details including fee calculations
++     */
++    function withdrawERC20(
++        address _to,
++        YLD_Metadata memory MetaData
++    ) external isValidIssuer {
++        AssetDefinition memory AssetData = registry.fetchAssetData(assetID);
++
++        if (
++            iSTBL_PT1_AssetOracle(AssetData.oracle).fetchForwardPrice(
++                VaultData.assetDepositNet
++            ) < (VaultData.depositValueUSD)
++        )
++            revert STBL_Asset_InsufficientVaultValue(
++                iSTBL_PT1_AssetOracle(AssetData.oracle).fetchForwardPrice(
++                    VaultData.assetDepositNet
++                ),
++                VaultData.depositValueUSD
++            );
++
++        uint256 withdrawfeeAmount = calculateWithdrawFees(
++            MetaData,
++            AssetData.withdrawFees
++        );
++
++        /** Calculate Withdraw asset value */
++        uint256 withdrawAssetValue = iSTBL_PT1_AssetOracle(AssetData.oracle)
++            .fetchInversePrice(
++                ((MetaData.stableValueNet + MetaData.haircutAmount) -
++                    withdrawfeeAmount)
++            );
++
++        uint256 withdrawFeeAssetValue = iSTBL_PT1_AssetOracle(AssetData.oracle)
++            .fetchInversePrice(withdrawfeeAmount);
++
++        /** Transfer Asset outward post decimal conversion */
++        IERC20(AssetData.token).safeTransfer(
++            _to,
++            withdrawAssetValue.convertFrom18Decimals(
++                DecimalConverter.getTokenDecimals(AssetData.token)
++            )
++        );
++
++        /** Deduct Withdraw fees */
++        VaultData.withdrawFees += withdrawFeeAssetValue;
++
++        /** Deduct USD Value Withdrawn */
++        VaultData.depositValueUSD -=
++            MetaData.stableValueNet +
++            MetaData.haircutAmount;
++
++        /** Deduct Hair Cut values */
++        VaultData.cumilativeHairCutValue -= MetaData
++            .haircutAmount; /** look at this in depth */
++
++        /** */
++        VaultData.assetDepositNet -= (withdrawAssetValue +
++            withdrawFeeAssetValue);
++        VaultData.assetDepositGross -= MetaData.assetValue;
++
++        emit withdrawEvent(
++            AssetData.token,
++            _to,
++            withdrawAssetValue,
++            withdrawfeeAmount,
++            withdrawFeeAssetValue,
++            MetaData.haircutAmount
++        );
++    }
++
++    /**
++     * @notice Calculates potential yield based on asset price appreciation vs tracked USD value
++     * @dev Internal function comparing current oracle-based USD value against historical deposit tracking
++     * @dev Returns positive differential when current asset value exceeds tracked USD deposits
++     * @return Price differential in USD (18 decimals) representing available yield, or 0 if no appreciation
++     */
++    function iCalculatePriceDifferentiation() internal view returns (uint256) {
++        AssetDefinition memory AssetData = registry.fetchAssetData(assetID);
++
++        uint256 USDValueOfDepositValue = iSTBL_PT1_AssetOracle(AssetData.oracle)
++            .fetchForwardPrice(VaultData.assetDepositNet);
++
++        if (USDValueOfDepositValue > VaultData.depositValueUSD) {
++            return USDValueOfDepositValue - VaultData.depositValueUSD;
++        } else {
++            return (0);
++        }
++    }
++
++    /**
++     * @notice Distributes accumulated yield from asset appreciation to protocol reward distributor
++     * @dev Calculates yield differential, deducts protocol fees, and transfers tokens to distributor
++     * @dev Only executes distribution when positive price differential exists
++     * @dev Restricted to protocol treasury address for security
++     * @custom:event YieldDistributed Emitted with yield distribution details including fees and amounts
++     */
++    function distributeYield() external {
++        AssetDefinition memory AssetData = registry.fetchAssetData(assetID);
++        uint256 differentialUSD = iCalculatePriceDifferentiation();
++
++        if (!registry.hasRole(YIELD_DISTRIBUTION_ROLE, _msgSender()))
++            revert STBL_UnauthorizedCaller();
++
++        if (differentialUSD > 0) {
++            (uint256 yield, uint256 yieldFee) = AssetData.calculateYieldFee(
++                differentialUSD
++            );
++
++            uint256 yieldFeeAssetValue = iSTBL_PT1_AssetOracle(AssetData.oracle)
++                .fetchInversePrice(yieldFee);
++
++            uint256 yieldAssetValue = iSTBL_PT1_AssetOracle(AssetData.oracle)
++                .fetchInversePrice(yield);
++
++            VaultData.yieldFees += yieldFeeAssetValue;
++
++            IERC20(AssetData.token).approve(
++                AssetData.rewardDistributor,
++                yieldAssetValue.convertFrom18Decimals(
++                    DecimalConverter.getTokenDecimals(AssetData.token)
++                )
++            );
++
++            VaultData.assetDepositNet -= yieldAssetValue + yieldFeeAssetValue;
++
++            iSTBL_PT1_AssetYieldDistributor(AssetData.rewardDistributor)
++                .distributeReward(
++                    yieldAssetValue.convertFrom18Decimals(
++                        DecimalConverter.getTokenDecimals(AssetData.token)
++                    )
++                );
++
++            emit YieldDistributed(
++                AssetData.token,
++                AssetData.rewardDistributor,
++                yield,
++                yieldFee,
++                yieldAssetValue
++            );
++        }
++    }
++
++    /**
++     * @notice External view function exposing price differential calculation for yield potential
++     * @dev Public interface to check available yield without executing distribution
++     * @dev Used by external contracts, interfaces, and monitoring systems
++     * @return Price differential value in USD (18 decimals) representing distributable yield
++     */
++    function CalculatePriceDifferentiation() external view returns (uint256) {
++        return iCalculatePriceDifferentiation();
++    }
++
++    /**
++     * @notice Transfers all accumulated protocol fees to the designated treasury address
++     * @dev Consolidates deposit, withdrawal, yield, and insurance fees for batch transfer
++     * @dev Resets all fee counters to zero after successful transfer completion
++     * @dev Validates treasury address existence before executing transfer
++     * @custom:event FeesWithdrawn Emitted with detailed breakdown of all withdrawn fee categories
++     */
++    function withdrawFees() external {
++        AssetDefinition memory AssetData = registry.fetchAssetData(assetID);
++        address treasury = registry.fetchTreasury();
++
++        if (treasury == address(0)) revert STBL_InvalidTreasury();
++
++        /** Calculate fees Value */
++        uint256 Fees = VaultData.depositFees +
++            VaultData.withdrawFees +
++            VaultData.yieldFees +
++            VaultData.insuranceFees;
++
++        /** Transfer Fees Outside */
++        IERC20(AssetData.token).safeTransfer(
++            treasury,
++            Fees.convertFrom18Decimals(
++                DecimalConverter.getTokenDecimals(AssetData.token)
++            )
++        );
++        emit FeesWithdrawn(
++            treasury,
++            VaultData.depositFees,
++            VaultData.withdrawFees,
++            VaultData.yieldFees,
++            VaultData.insuranceFees,
++            Fees
++        );
++
++        /** Reset Counters */
++        VaultData.depositFees = 0;
++        VaultData.withdrawFees = 0;
++        VaultData.yieldFees = 0;
++        VaultData.insuranceFees = 0;
++    }
++
++    /**
++     * @notice Drains a specified amount of tokens from the vault to treasury during emergency situations
++     * @dev Emergency function that transfers tokens directly to treasury when asset is disabled
++     * @dev Can only be executed when the asset status is not ENABLED for security purposes
++     * @dev Reduces the net asset deposit tracking by the withdrawn amount
++     * @custom:event EmergencyFundsWithdraw Emitted with the amount of tokens withdrawn
++     * @custom:security Only callable when asset is disabled and treasury address is valid
++     */
++    function emergencyWithdraw() external {
++        AssetDefinition memory AssetData = registry.fetchAssetData(assetID);
++        address treasury = registry.fetchTreasury();
++
++        if (treasury == address(0)) revert STBL_InvalidTreasury();
++        if (AssetData.status != AssetStatus.EMERGENCY_STOP)
++            revert STBL_AssetActive();
++
++        uint256 balance = IERC20(AssetData.token).balanceOf(address(this));
++
++        IERC20(AssetData.token).safeTransfer(treasury, balance);
++        emit EmergencyFundsWithdraw(balance);
++    }
++
++    /**
++     * @notice Calculates withdrawal fees based on gross stable value and fee percentage
++     * @dev Internal pure function that computes fees without modifying state
++     * @dev Fee calculation: (stableValueGross * withdrawFee) / FEES_CONSTANT
++     * @param MetaData Withdrawal metadata containing stable value information
++     * @param withdrawFee Fee percentage to be applied (scaled by FEES_CONSTANT)
++     * @return withdrawfeeAmount Calculated withdrawal fee amount in stable value units
++     */
++    function calculateWithdrawFees(
++        YLD_Metadata memory MetaData,
++        uint256 withdrawFee
++    ) internal pure returns (uint256 withdrawfeeAmount) {
++        withdrawfeeAmount =
++            (MetaData.stableValueGross * withdrawFee) /
++            FEES_CONSTANT;
++    }
++
++    /**
++     * @notice Retrieves the asset ID managed by this vault instance
++     * @dev Returns the unique identifier for the asset type this vault handles
++     * @return The asset ID associated with this vault
++     */
++    function fetchAssetID() external view returns (uint256) {
++        return assetID;
++    }
++
++    /**
++     * @notice Retrieves the protocol registry contract address
++     * @dev Returns the registry contract that provides system configuration and access control
++     * @return The address of the protocol registry contract
++     */
++    function fetchRegistry() external view returns (address) {
++        return address(registry);
++    }
++
++    /**
++     * @notice Retrieves the complete vault state data
++     * @dev Returns all vault metrics including deposits, fees, yields, and tracking values
++     * @return VaultStruct containing comprehensive vault state information
++     */
++    function fetchVaultData() external view returns (VaultStruct memory) {
++        return VaultData;
++    }
++
++    /**
++     * @notice Retrieves the trusted forwarder address for ERC2771 meta-transaction support
++     * @dev Queries registry for current trusted forwarder configuration
++     * @dev Used by ERC2771Context to validate and process meta-transactions
++     * @return Address of the currently configured trusted forwarder contract
++     */
++    function trustedForwarder() public view virtual override returns (address) {
++        return registry.trustedForwarder();
++    }
++
++    /**
++     * @notice Resolves inheritance conflict for _msgSender() between ERC2771Context and Context
++     * @dev Returns the actual transaction sender, accounting for meta-transaction forwarding
++     * @dev Prioritizes ERC2771Context implementation for proper meta-transaction handling
++     * @return Actual sender address of the current transaction
++     */
++    function _msgSender()
++        internal
++        view
++        override(ERC2771ContextUpgradeable)
++        returns (address)
++    {
++        return ERC2771ContextUpgradeable._msgSender();
++    }
++
++    /**
++     * @notice Resolves inheritance conflict for _msgData() between ERC2771Context and Context
++     * @dev Returns the actual transaction calldata, accounting for meta-transaction forwarding
++     * @dev Prioritizes ERC2771Context implementation for proper meta-transaction handling
++     * @return Complete calldata of the current transaction
++     */
++    function _msgData()
++        internal
++        view
++        override(ERC2771ContextUpgradeable)
++        returns (bytes calldata)
++    {
++        return ERC2771ContextUpgradeable._msgData();
++    }
++
++    /**
++     * @notice Resolves inheritance conflict for _contextSuffixLength() in ERC2771Context
++     * @dev Returns the length of context suffix used in meta-transaction processing
++     * @dev Prioritizes ERC2771Context implementation for proper meta-transaction handling
++     * @return Length of the context suffix for meta-transaction support
++     */
++    function _contextSuffixLength()
++        internal
++        view
++        override(ERC2771ContextUpgradeable)
++        returns (uint256)
++    {
++        return ERC2771ContextUpgradeable._contextSuffixLength();
++    }
++}
+diff -ruN sources/STBL_PT1_Vault-OUSG//prior/contracts/asset/PT1/interfaces/ISTBL_PT1_AssetIssuer.sol sources/STBL_PT1_Vault-OUSG//current/contracts/asset/PT1/interfaces/ISTBL_PT1_AssetIssuer.sol
+--- sources/STBL_PT1_Vault-OUSG//prior/contracts/asset/PT1/interfaces/ISTBL_PT1_AssetIssuer.sol	1969-12-31 21:00:00
++++ sources/STBL_PT1_Vault-OUSG//current/contracts/asset/PT1/interfaces/ISTBL_PT1_AssetIssuer.sol	2026-09-24 23:43:09
+@@ -0,0 +1,122 @@
++// SPDX-License-Identifier: MIT
++pragma solidity ^0.8.20;
++
++import "@stbl-protocol/stbl-contracts-evm-core/contracts/lib/STBL_Structs.sol";
++
++/**
++ * @title STBL Asset Issuer Interface
++ * @notice Interface for handling the issuance and redemption of stable assets in the Pi Protocol
++ * @dev Acts as an intermediary between users and the protocol's core components for asset management
++ */
++interface iSTBL_PT1_AssetIssuer {
++    /**
++     * @notice Emitted when an asset is deposited into the protocol
++     * @dev Contains detailed information about the deposit transaction and minted NFT
++     * @param user Address of the user making the deposit
++     * @param _tokenID Unique identifier of the NFT minted to represent the deposited asset
++     * @param _MetaData Metadata structure containing comprehensive details about the deposited asset
++     */
++    event depositAsset(
++        address indexed user,
++        uint256 _tokenID,
++        YLD_Metadata _MetaData
++    );
++
++    /**
++     * @notice Emitted when an asset is withdrawn from the protocol
++     * @dev Triggered when a user burns their NFT to withdraw the underlying asset
++     * @param user Address of the user withdrawing the asset
++     * @param _tokenID ID of the NFT being burned during the withdrawal process
++     * @param _MetaData Metadata structure containing details about the withdrawn asset
++     */
++    event withdrawAsset(
++        address indexed user,
++        uint256 _tokenID,
++        YLD_Metadata _MetaData
++    );
++
++    /**
++     * @notice Emitted when an asset is withdrawn from the protocol treasury
++     * @dev Used for administrative or treasury-related asset withdrawals
++     * @param user Address of the user or admin withdrawing the asset from treasury
++     * @param _tokenID ID of the NFT burned during the treasury withdrawal operation
++     * @param _MetaData Metadata structure containing comprehensive details about the withdrawn asset
++     */
++    event withdrawAssetTreasury(
++        address indexed user,
++        uint256 _tokenID,
++        YLD_Metadata _MetaData
++    );
++
++    /**
++     * @notice Emitted when the contract implementation is upgraded
++     * @dev Triggered during an upgrade of the contract to a new implementation
++     * @param newImplementation Address of the new implementation contract
++     */
++    event ContractUpgraded(address newImplementation);
++
++    /**
++     * @notice Deposits real-world assets and mints a yield-bearing NFT to the caller
++     * @dev Wrapper function that calls iDeposit with the message sender as the recipient
++     * @param assetValue Amount of assets to deposit, specified in the asset's native decimal precision
++     * @return nftID The unique identifier of the minted NFT that represents ownership of the deposited assets
++     */
++    function deposit(uint256 assetValue) external returns (uint256);
++
++    /**
++     * @notice Deposits real-world assets and mints a yield-bearing NFT to a specified sender
++     * @dev Wrapper function that calls iDeposit with a custom sender address
++     * @param assetValue Amount of assets to deposit, specified in the asset's native decimal precision
++     * @param _sender The address that will receive the ownership NFT
++     * @return nftID The unique identifier of the minted NFT that represents ownership of the deposited assets
++     */
++    function deposit(
++        uint256 assetValue,
++        address _sender
++    ) external returns (uint256);
++
++    /**
++     * @notice Withdraws deposited assets by burning the caller's yield-bearing NFT
++     * @dev Wrapper function that calls iWithdraw with the message sender as the owner
++     * @param _tokenID The unique identifier of the NFT to burn in exchange for withdrawing the underlying assets
++     */
++    function withdraw(uint256 _tokenID) external;
++
++    /**
++     * @notice Withdraws deposited assets by burning a specified sender's yield-bearing NFT
++     * @dev Wrapper function that calls iWithdraw with a custom sender address
++     * @param _tokenID The unique identifier of the NFT to burn in exchange for withdrawing the underlying assets
++     * @param _sender The address of the account withdrawing assets
++     */
++    function withdraw(uint256 _tokenID, address _sender) external;
++
++    /**
++     * @notice Enables yield generation for a specific NFT
++     * @dev Activates staking for an NFT in the yield distribution system to start earning rewards
++     * @param _tokenID The unique identifier of the NFT to enable yield generation for
++     * @custom:security Requires SPLITTER_ROLE for access control
++     */
++    function enableYield(uint256 _tokenID) external;
++
++    /**
++     * @notice Disables yield generation for a specific NFT
++     * @dev Deactivates staking for an NFT in the yield distribution system to stop earning rewards
++     * @param _tokenID The unique identifier of the NFT to disable yield generation for
++     * @custom:security Requires SPLITTER_ROLE for access control
++     */
++    function disableYield(uint256 _tokenID) external;
++
++    /**
++     * @notice Retrieves the asset ID managed by this vault instance
++     * @dev Returns the unique identifier for the asset type this vault handles
++     * @return The asset ID associated with this vault
++     */
++    function fetchAssetID() external view returns (uint256);
++
++    /**
++     * @notice Retrieves the protocol registry contract address
++     * @dev Returns the registry contract that provides system configuration and access control
++     * @return The address of the protocol registry contract
++     */
++    function fetchRegistry() external view returns (address);
++}
+diff -ruN sources/STBL_PT1_Vault-OUSG//prior/contracts/asset/PT1/interfaces/ISTBL_PT1_AssetOracle.sol sources/STBL_PT1_Vault-OUSG//current/contracts/asset/PT1/interfaces/ISTBL_PT1_AssetOracle.sol
+--- sources/STBL_PT1_Vault-OUSG//prior/contracts/asset/PT1/interfaces/ISTBL_PT1_AssetOracle.sol	1969-12-31 21:00:00
++++ sources/STBL_PT1_Vault-OUSG//current/contracts/asset/PT1/interfaces/ISTBL_PT1_AssetOracle.sol	2026-09-24 23:43:09
+@@ -0,0 +1,60 @@
++// SPDX-License-Identifier: MIT
++pragma solidity ^0.8.20;
++
++/**
++ * @title STBL Asset Price Oracle Interface
++ * @notice Interface for retrieving asset price information in the STBL protocol
++ * @dev This interface defines the standard methods for price oracles used by the STBL system
++ */
++interface iSTBL_PT1_AssetOracle {
++    /** @notice Emitted when the oracle is enabled
++     */
++    event oracleEnabled();
++
++    /** @notice Emitted when the oracle is disabled
++     */
++    event oracleDisabled();
++
++    /** @notice Emitted when the oracle decimals are set
++     * @param _decimals The number of decimals set for price representation
++     */
++    event oracleSetDecimals(uint256 _decimals);
++
++    /** @notice Emitted when the oracle price threshold is set
++     * @param _threshold The price threshold that was set
++     */
++    event oracleSetPriceThreshold(uint256 _threshold);
++
++    /** @notice Enables the oracle
++     * @dev Only admin can call this function
++     */
++    function enableOracle() external;
++
++    /** @notice Disables the oracle
++     * @dev Only admin can call this function
++     */
++    function disableOracle() external;
++
++    /** @notice Sets the number of decimals for price representation
++     * @param _decimals The number of decimals to be used for price representation
++     * @dev Only admin can call this function
++     */
++    function setPriceDecimals(uint256 _decimals) external;
++
++    /** @notice Sets the price threshold
++     * @param _threshold The price threshold to be set
++     * @dev Only admin can call this function
++     */
++    function setPriceThreshold(uint256 _threshold) external;
++
++    /** @notice Gets the number of decimals for the price
++     * @return The number of decimals used for price representation (8 decimals)
++     */
++    function getPriceDecimals() external view returns (uint256);
++
++    /** @notice Retrieves the current price of the USDY asset
++     * @return price The current price of the USDY asset with 8 decimal precision
++     * @dev Returns the stored price value for the USDY asset
++     */
++    function fetchPrice() external view returns (uint256);
++}
+diff -ruN sources/STBL_PT1_Vault-OUSG//prior/contracts/asset/PT1/interfaces/ISTBL_PT1_AssetVault.sol sources/STBL_PT1_Vault-OUSG//current/contracts/asset/PT1/interfaces/ISTBL_PT1_AssetVault.sol
+--- sources/STBL_PT1_Vault-OUSG//prior/contracts/asset/PT1/interfaces/ISTBL_PT1_AssetVault.sol	1969-12-31 21:00:00
++++ sources/STBL_PT1_Vault-OUSG//current/contracts/asset/PT1/interfaces/ISTBL_PT1_AssetVault.sol	2026-09-24 23:43:09
+@@ -0,0 +1,164 @@
++// SPDX-License-Identifier: MIT
++pragma solidity ^0.8.20;
++
++import "@stbl-protocol/stbl-contracts-evm-core/contracts/lib/STBL_Structs.sol";
++
++/**
++ * @title Asset Vault Interface
++ * @notice Manages the secure storage and handling of assets in the Pi Protocol
++ * @dev Implements access control for asset custody and yield distribution
++ */
++interface iSTBL_PT1_AssetVault {
++    /**
++     * @notice Emitted when tokens are deposited into the vault
++     * @param _token Address of the ERC20 token being deposited
++     * @param _from Address sending the tokens into the vault
++     * @param _depositValue Total amount of tokens deposited
++     * @param _depositFee Fee charged on the deposit transaction
++     * @param _hairCut Percentage reduction applied to deposit value
++     * @param _insuranceFee Additional fee for insurance protection
++     * @param _depositFeesAssetValue Asset value of the deposit fee amount
++     * @param _insuranceFeeAssetValue Asset value of the insurance fee amount
++     */
++    event depositEvent(
++        address _token,
++        address _from,
++        uint256 _depositValue,
++        uint256 _depositFee,
++        uint256 _insuranceFee,
++        uint256 _hairCut,
++        uint256 _depositFeesAssetValue,
++        uint256 _insuranceFeeAssetValue
++    );
++
++    /**
++     * @notice Emitted when tokens are withdrawn from the vault
++     * @param _token Address of the ERC20 token being withdrawn
++     * @param _to Address receiving the tokens from the vault
++     * @param _netValue Net amount of tokens withdrawn after fees and haircuts
++     * @param _withdrawFee Fee charged on the withdrawal transaction
++     * @param _withdrawFeeAssetValue Asset value of the withdrawal fee amount
++     * @param _hairCut Percentage reduction applied to withdrawal value
++     */
++    event withdrawEvent(
++        address _token,
++        address _to,
++        uint256 _netValue,
++        uint256 _withdrawFee,
++        uint256 _withdrawFeeAssetValue,
++        uint256 _hairCut
++    );
++
++    /**
++     * @notice Emitted when yield is distributed to participants
++     * @param token Address of the ERC20 token for which yield is distributed
++     * @param distributor Address that initiated the yield distribution
++     * @param netYield Net amount of yield distributed to participants
++     * @param yieldFee Fee charged on the yield distribution
++     * @param yieldValue Total gross yield value before fees
++     */
++    event YieldDistributed(
++        address indexed token,
++        address indexed distributor,
++        uint256 netYield,
++        uint256 yieldFee,
++        uint256 yieldValue
++    );
++
++    /**
++     * @notice Event emitted when deposit, withdrawal, yield, and insurance fees are withdrawn to treasury
++     * @param treasury Address where token fees are withdrawn
++     * @param depositFees Total amount of deposit fees withdrawn
++     * @param withdrawFees Total amount of withdrawal fees withdrawn
++     * @param yieldFees Total amount of yield fees withdrawn
++     * @param insuranceFees Total amount of insurance fees withdrawn
++     * @param Fees Total Fees priced in asset value
++     */
++    event FeesWithdrawn(
++        address indexed treasury,
++        uint256 depositFees,
++        uint256 withdrawFees,
++        uint256 yieldFees,
++        uint256 insuranceFees,
++        uint256 Fees
++    );
++
++    /**
++     * @notice Emitted when emergency funds are withdrawn from the vault
++     * @param _amt Amount of funds withdrawn during the emergency procedure
++     */
++    event EmergencyFundsWithdraw(uint256 _amt);
++
++    /**
++     * @notice Emitted when the contract implementation is upgraded
++     * @dev Triggered during an upgrade of the contract to a new implementation
++     * @param newImplementation Address of the new implementation contract
++     */
++    event ContractUpgraded(address newImplementation);
++
++    /**
++     * @notice Handles secure ERC20 token deposits into the asset vault
++     * @dev Validates and processes token deposits with metadata containing fee and haircut information
++     * @param _from Address initiating the token deposit
++     * @param MetaData Structured data containing deposit value, fees, haircuts and other token metadata
++     */
++    function depositERC20(address _from, YLD_Metadata memory MetaData) external;
++
++    /**
++     * @notice Handles ERC20 token withdrawals from the vault
++     * @dev Only callable by the valid issuer
++     * @param _to Address to receive the tokens
++     * @param MetaData Structured data containing withdrawal details including value, fees, and haircuts
++     */
++    function withdrawERC20(address _to, YLD_Metadata memory MetaData) external;
++
++    /**
++     * @notice Distributes accumulated yield to vault participants
++     * @dev Calculates and distributes yield based on predefined protocols
++     */
++    function distributeYield() external;
++
++    /**
++     * @notice Calculates the price differentiation for the asset
++     * @dev Computes the price variance or spread for the asset under management
++     * @return The calculated price differentiation metric
++     */
++    function CalculatePriceDifferentiation() external view returns (uint256);
++
++    /**
++     * @notice Withdraws accumulated protocol fees to the treasury
++     * @dev Transfers accumulated fees from deposit, withdrawal, and other sources
++     */
++    function withdrawFees() external;
++
++    /**
++     * @notice Drains a specified amount of tokens from the vault to treasury during emergency situations
++     * @dev Emergency function that transfers tokens directly to treasury when asset is disabled
++     * @dev Can only be executed when the asset status is not ENABLED for security purposes
++     * @dev Reduces the net asset deposit tracking by the withdrawn amount
++     * @custom:event EmergencyFundsWithdraw Emitted with the amount of tokens withdrawn
++     * @custom:security Only callable when asset is disabled and treasury address is valid
++     */
++    function emergencyWithdraw() external;
++
++    /**
++     * @notice Retrieves the asset ID managed by this vault instance
++     * @dev Returns the unique identifier for the asset type this vault handles
++     * @return The asset ID associated with this vault
++     */
++    function fetchAssetID() external view returns (uint256);
++
++    /**
++     * @notice Retrieves the protocol registry contract address
++     * @dev Returns the registry contract that provides system configuration and access control
++     * @return The address of the protocol registry contract
++     */
++    function fetchRegistry() external view returns (address);
++
++    /**
++     * @notice Retrieves the complete vault state data
++     * @dev Returns all vault metrics including deposits, fees, yields, and tracking values
++     * @return VaultStruct containing comprehensive vault state information
++     */
++    function fetchVaultData() external view returns (VaultStruct memory);
++}
+diff -ruN sources/STBL_PT1_Vault-OUSG//prior/contracts/asset/PT1/interfaces/ISTBL_PT1_AssetYieldDistributor.sol sources/STBL_PT1_Vault-OUSG//current/contracts/asset/PT1/interfaces/ISTBL_PT1_AssetYieldDistributor.sol
+--- sources/STBL_PT1_Vault-OUSG//prior/contracts/asset/PT1/interfaces/ISTBL_PT1_AssetYieldDistributor.sol	1969-12-31 21:00:00
++++ sources/STBL_PT1_Vault-OUSG//current/contracts/asset/PT1/interfaces/ISTBL_PT1_AssetYieldDistributor.sol	2026-09-24 23:43:09
+@@ -0,0 +1,103 @@
++// SPDX-License-Identifier: MIT
++pragma solidity ^0.8.20;
++
++import "@stbl-protocol/stbl-contracts-evm-core/contracts/lib/STBL_Structs.sol";
++
++/**
++ * @title STBL Asset Yield Distributor Interface
++ * @notice Interface for managing reward distribution for staked assets in the STBL Protocol
++ * @dev Defines the contract interface for reward calculation, distribution, and tracking for yield-bearing assets
++ * @author STBL Protocol Team
++ */
++interface iSTBL_PT1_AssetYieldDistributor {
++    /**
++     * @notice Emitted when rewards are distributed to all stakers
++     * @param amount The total amount of rewards distributed
++     */
++    event RewardDistributed(uint256 amount);
++
++    /**
++     * @notice Emitted when staking is enabled for a specific token
++     * @param id The token ID for which staking is enabled
++     * @param amount The amount being staked
++     */
++    event StakingEnabled(uint256 indexed id, uint256 amount);
++
++    /**
++     * @notice Emitted when staking is disabled for a specific token
++     * @param id The token ID for which staking is disabled
++     * @param amount The amount being unstaked
++     */
++    event StakingDisabled(uint256 indexed id, uint256 amount);
++
++    /**
++     * @notice Emitted when rewards are claimed by a token holder
++     * @param tokenId The token ID for which rewards are claimed
++     * @param amount The amount of rewards claimed
++     */
++    event RewardClaimed(uint256 indexed tokenId, uint256 amount);
++
++    /**
++     * @notice Emitted when the contract implementation is upgraded
++     * @dev Triggered during an upgrade of the contract to a new implementation
++     * @param newImplementation Address of the new implementation contract
++     */
++    event ContractUpgraded(address newImplementation);
++
++    /**
++     * @notice Distributes rewards proportionally to all active stakers
++     * @param reward The total amount of rewards to distribute
++     * @dev Can only be called by the authorized vault contract
++     * @dev Updates the global reward per token accumulated value
++     */
++    function distributeReward(uint256 reward) external;
++
++    /**
++     * @notice Calculates the total unclaimed rewards for a specific token ID
++     * @param id The token ID to calculate rewards for
++     * @return The total amount of rewards earned but not yet claimed
++     * @dev Returns 0 if the token is not currently staking or has no rewards
++     */
++    function calculateRewardsEarned(uint256 id) external view returns (uint256);
++
++    /**
++     * @notice Enables staking for a token ID with specified stake amount
++     * @param id The token ID to enable staking for
++     * @param value The amount to stake for this token
++     * @dev Can only be called by the authorized issuer contract
++     * @dev Updates the token's staking status and begins reward accumulation
++     */
++    function enableStaking(uint256 id, uint256 value) external;
++
++    /**
++     * @notice Disables staking for a token ID and unstakes specified amount
++     * @param id The token ID to disable staking for
++     * @param value The amount to unstake
++     * @dev Can only be called by the authorized issuer contract
++     * @dev Automatically claims any pending rewards before disabling
++     */
++    function disableStaking(uint256 id, uint256 value) external;
++
++    /**
++     * @notice Claims all accumulated rewards for a specific token ID
++     * @param id The token ID to claim rewards for
++     * @return The amount of rewards claimed and transferred
++     * @dev Can only be called by the token owner or authorized operator
++     * @dev Resets the reward counter for the token after claiming
++     */
++    function claim(uint256 id) external returns (uint256);
++
++    /**
++     * @notice Retrieves the asset ID managed by this vault instance
++     * @dev Returns the unique identifier for the asset type this vault handles
++     * @return The asset ID associated with this vault
++     */
++    function fetchAssetID() external view returns (uint256);
++
++    /**
++     * @notice Retrieves the protocol registry contract address
++     * @dev Returns the registry contract that provides system configuration and access control
++     * @return The address of the protocol registry contract
++     */
++    function fetchRegistry() external view returns (address);
++}
+diff -ruN sources/STBL_PT1_Vault-OUSG//prior/contracts/asset/PT1/lib/STBL_OracleLib.sol sources/STBL_PT1_Vault-OUSG//current/contracts/asset/PT1/lib/STBL_OracleLib.sol
+--- sources/STBL_PT1_Vault-OUSG//prior/contracts/asset/PT1/lib/STBL_OracleLib.sol	1969-12-31 21:00:00
++++ sources/STBL_PT1_Vault-OUSG//current/contracts/asset/PT1/lib/STBL_OracleLib.sol	2026-09-24 23:43:09
+@@ -0,0 +1,44 @@
++// SPDX-License-Identifier: MIT
++pragma solidity ^0.8.20;
++
++import "@stbl-protocol/stbl-contracts-evm-core/contracts/lib/STBL_Structs.sol";
++
++import "../interfaces/ISTBL_PT1_AssetOracle.sol";
++
++/**
++ * @title Oracle Library Functions
++ * @notice Library providing utility functions for asset oracle price calculations
++ * @dev Contains functions for forward and inverse price calculations using oracle data
++ */
++library STBL_OracleLib {
++    /**
++     * @notice Fetches and calculates forward price from oracle contract
++     * @dev Multiplies oracle price by amount and adjusts for price decimals
++     * @param oracle The oracle contract implementing iSTBL_AssetOracle interface
++     * @param amount The amount to calculate price for (in token units)
++     * @return forwardPrice Calculated forward price adjusted for oracle decimals
++     */
++    function fetchForwardPrice(
++        iSTBL_PT1_AssetOracle oracle,
++        uint256 amount
++    ) internal view returns (uint256 forwardPrice) {
++        forwardPrice = ((oracle.fetchPrice() * amount) /
++            (10 ** oracle.getPriceDecimals()));
++    }
++
++    /**
++     * @notice Fetches and calculates inverse price from oracle contract
++     * @dev Divides amount by oracle price and adjusts for price decimals
++     * @param oracle The oracle contract implementing iSTBL_AssetOracle interface
++     * @param amount The amount to calculate inverse price for (in token units)
++     * @return inversePrice Calculated inverse price adjusted for oracle decimals
++     */
++    function fetchInversePrice(
++        iSTBL_PT1_AssetOracle oracle,
++        uint256 amount
++    ) internal view returns (uint256 inversePrice) {
++        inversePrice =
++            (amount * (10 ** oracle.getPriceDecimals())) /
++            oracle.fetchPrice();
++    }
++}
+diff -ruN sources/STBL_PT1_Vault-OUSG//prior/contracts/asset/PT1/lib/STBL_PT1_Asset_Errors.sol sources/STBL_PT1_Vault-OUSG//current/contracts/asset/PT1/lib/STBL_PT1_Asset_Errors.sol
+--- sources/STBL_PT1_Vault-OUSG//prior/contracts/asset/PT1/lib/STBL_PT1_Asset_Errors.sol	1969-12-31 21:00:00
++++ sources/STBL_PT1_Vault-OUSG//current/contracts/asset/PT1/lib/STBL_PT1_Asset_Errors.sol	2026-09-24 23:43:09
+@@ -0,0 +1,85 @@
++// SPDX-License-Identifier: MIT
++pragma solidity ^0.8.20;
++
++/**
++ * @notice Thrown when the asset setup is not complete or inactive
++ * @param id The ID of the asset that is not properly setup
++ */
++error STBL_Asset_SetupNotComplete(uint256 id);
++
++/**
++ * @notice Thrown when an unauthorized issuer attempts an operation
++ * @dev Used in the isValidIssuer modifier to restrict access
++ * @param id The ID of the asset with the invalid issuer
++ */
++error STBL_Asset_InvalidIssuer(uint256 id);
++
++/**
++ * @notice Thrown when the calling address is not the valid vault contract
++ * @param id The ID of the asset with the invalid vault address
++ */
++error STBL_Asset_InvalidVault(uint256 id);
++
++/**
++ * @notice Thrown when attempting to interact with an invalid asset
++ * @param id The ID of the invalid asset
++ */
++error STBL_Asset_InvalidAsset(uint256 id);
++
++/**
++ * @notice Thrown when the provided owner does not match the expected owner
++ * @param _tokenID The token ID for which withdrawal was attempted too early
++ * @param owner The owner ID that was provided but is incorrect
++ */
++error STBL_Asset_IncorrectOwner(uint256 _tokenID, address owner);
++
++/**
++ * @notice Thrown when attempting to call a function before contract initialization
++ * @param id The ID of the uninitialized asset
++ */
++error STBL_Asset_NotInitialized(uint256 id);
++
++/**
++ * @notice Thrown when attempting to initialize an already initialized asset
++ * @param id The ID of the asset that is already initialized
++ */
++error STBL_Asset_Initialized(uint256 id);
++
++/**
++ * @notice Thrown when attempting to withdraw before the required duration has passed
++ * @param id The ID of the asset where early withdrawal was attempted
++ * @param _tokenID The token ID for which withdrawal was attempted too early
++ */
++error STBL_Asset_WithdrawDurationNotReached(uint256 id, uint256 _tokenID);
++
++/**
++ * @notice Thrown when attempting to claim yield before the required duration has passed
++ * @param id The ID of the asset where early yield claim was attempted
++ * @param duration The required duration that must be satisfied before claiming yield
++ */
++error STBL_Asset_YieldDurationNotReached(uint256 id, uint256 duration);
++
++/**
++ * @notice Thrown when the vault value is insufficient compared to the asset value
++ * @param _assetValue The current asset value that is being compared
++ * @param _usdValue The USD value that is insufficient for the operation
++ */
++error STBL_Asset_InsufficientVaultValue(uint256 _assetValue, uint256 _usdValue);
++
++/**
++ * @notice Thrown when an invalid deposit amount is provided
++ * @param assetID The ID of the asset for which the invalid deposit was attempted
++ * @param amount The invalid deposit amount that was provided
++ */
++error STBL_Asset_InvalidDepositAmount(uint256 assetID, uint256 amount);
++/**
++ * @notice Thrown when the oracle price is stale or outdated
++ * @param price The stale price value returned by the oracle
++ * @param time The timestamp when the stale price was last updated
++ */
++error STBL_Asset_OracleStalePrice(uint256 price, uint256 time);
++
++/**
++ * @notice Thrown when the oracle is disabled or not available
++ */
++error STBL_Asset_OracleDisabled();
+diff -ruN sources/STBL_PT1_Vault-OUSG//prior/contracts/interfaces/ISTBL_Core.sol sources/STBL_PT1_Vault-OUSG//current/contracts/interfaces/ISTBL_Core.sol
+--- sources/STBL_PT1_Vault-OUSG//prior/contracts/interfaces/ISTBL_Core.sol	2026-09-24 23:43:10
++++ sources/STBL_PT1_Vault-OUSG//current/contracts/interfaces/ISTBL_Core.sol	1969-12-31 21:00:00
+@@ -1,108 +0,0 @@
+-// SPDX-License-Identifier: MIT
+-pragma solidity ^0.8.20;
+-
+-import "../lib/STBL_Structs.sol";
+-
+-/**
+- * @title STBL Core Interface
+- * @notice Interface for core functionality of the STBL Protocol
+- * @dev Defines the main entry and exit points for assets in the protocol
+- */
+-interface iSTBL_Core {
+-    /**
+-     * @notice Emitted when an asset is deposited into the protocol
+-     * @param _id The asset identifier
+-     * @param _to Address receiving the minted token
+-     * @param _metadata Metadata associated with the YLD token
+-     * @param _tokenID ID of the minted token
+-     */
+-    event putEvent(
+-        uint256 indexed _id,
+-        address indexed _to,
+-        YLD_Metadata _metadata,
+-        uint256 _tokenID
+-    );
+-
+-    /**
+-     * @notice Emitted when an asset is withdrawn from the protocol
+-     * @param _id The asset identifier
+-     * @param _to Address receiving the withdrawn assets
+-     * @param _value The value of the withdrawn assets
+-     * @param _tokenID ID of the burned token
+-     */
+-    event exitEvent(
+-        uint256 indexed _id,
+-        address indexed _to,
+-        uint256 _value,
+-        uint256 _tokenID
+-    );
+-
+-    /**
+-     * @notice Event emitted when a trusted forwarder is updated
+-     * @param previousForwarder The address of the previous trusted forwarder
+-     * @param newForwarder The address of the new trusted forwarder
+-     * @dev Indicates a change in the trusted forwarder for meta-transactions
+-     */
+-    event TrustedForwarderUpdated(
+-        address indexed previousForwarder,
+-        address indexed newForwarder
+-    );
+-
+-    /**
+-     * @notice Emitted when the contract implementation is upgraded
+-     * @dev Triggered during an upgrade of the contract to a new implementation
+-     * @param newImplementation Address of the new implementation contract
+-     */
+-    event ContractUpgraded(address newImplementation);
+-
+-    /**
+-     * @notice Method to update trusted forwarder
+-     * @param _newForwarder Address of the new trusted forwarder
+-     * @dev Only callable by admin
+-     */
+-    function updateTrustedForwarder(address _newForwarder) external;
+-
+-    /**
+-     * @notice Issues X and Y tokens for a given asset
+-     * @dev Only callable by the asset issuer
+-     * @param _to Address to receive the tokens
+-     * @param _metadata Metadata associated with the YLD Token
+-     * @return nftID The ID of the minted Y token (NFT)
+-     */
+-    function put(
+-        address _to,
+-        YLD_Metadata memory _metadata
+-    ) external returns (uint256);
+-
+-    /**
+-     * @notice Withdraws assets from the protocol
+-     * @param _assetID The identifier of the asset being withdrawn
+-     * @param _from Address that owns the token being burned
+-     * @param _tokenID ID of the token to burn
+-     * @param _value The amount of X tokens to burn during redemption
+-     */
+-    function exit(
+-        uint256 _assetID,
+-        address _from,
+-        uint256 _tokenID,
+-        uint256 _value
+-    ) external;
+-
+-    /**
+-     * @notice Retrieves the USP token address
+-     * @return The address of the USP token contract
+-     */
+-    function fetchUSPToken() external view returns (address);
+-
+-    /**
+-     * @notice Retrieves the USI token address
+-     * @return The address of the USI token contract
+-     */
+-    function fetchUSIToken() external view returns (address);
+-
+-    /**
+-     * @notice Retrieves the registry address
+-     * @return The address of the registry contract
+-     */
+-    function fetchRegistry() external view returns (address);
+-}
+diff -ruN sources/STBL_PT1_Vault-OUSG//prior/contracts/interfaces/ISTBL_Register.sol sources/STBL_PT1_Vault-OUSG//current/contracts/interfaces/ISTBL_Register.sol
+--- sources/STBL_PT1_Vault-OUSG//prior/contracts/interfaces/ISTBL_Register.sol	2026-09-24 23:43:10
++++ sources/STBL_PT1_Vault-OUSG//current/contracts/interfaces/ISTBL_Register.sol	1969-12-31 21:00:00
+@@ -1,346 +0,0 @@
+-// SPDX-License-Identifier: MIT
+-pragma solidity ^0.8.20;
+-
+-import "@openzeppelin/contracts/access/IAccessControl.sol";
+-import "../lib/STBL_Structs.sol";
+-
+-/** @title STBL Register Interface
+- * @notice Interface for managing asset registrations and configurations in the STBL protocol
+- * @dev Inherits from OpenZeppelin's IAccessControl for role-based access control
+- */
+-interface iSTBL_Register is IAccessControl {
+-    /** @notice Emitted when the Core contract address is updated
+-     * @param _Core The new Core contract address
+-     */
+-    event CoreUpdateEvent(address _Core);
+-
+-    /** @notice Emitted when the treasury address is updated
+-     * @param _treasury The new treasury address
+-     */
+-    event TreasuryUpdateEvent(address _treasury);
+-
+-    /** @notice Emitted when a new asset is added to the registry
+-     * @param _id The ID of the added asset
+-     * @param _Assetdata The asset definition data
+-     */
+-    event AddAssetEvent(uint256 indexed _id, AssetDefinition _Assetdata);
+-
+-    /** @notice Emitted when an asset is setup with contract addresses and configuration
+-     * @param _id The ID of the setup asset
+-     * @param _Assetdata The complete asset definition containing all configuration parameters including
+-     * contract addresses, fee structures, limits, and durations
+-     */
+-    event SetupAssetEvent(uint256 indexed _id, AssetDefinition _Assetdata);
+-
+-    /** @notice Emitted when an asset's cut percentage is updated
+-     * @param _id The ID of the asset
+-     * @param _cut The new cut percentage value
+-     */
+-    event CutUpdateEvent(uint256 indexed _id, uint256 _cut);
+-
+-    /** @notice Emitted when an asset's limit is updated
+-     * @param _id The ID of the asset
+-     * @param _limit The new limit value
+-     */
+-    event LimitUpdateEvent(uint256 indexed _id, uint256 _limit);
+-
+-    /** @notice Emitted when an asset's fees are updated
+-     * @param _id The ID of the asset
+-     * @param _depositFee The new deposit fee value in basis points
+-     * @param _withdrawFee The new withdrawal fee value in basis points
+-     * @param _insuranceFee The new insurance fee value in basis points
+-     * @param _yieldFees The new yield fee value in basis points
+-     */
+-    event FeeUpdateEvent(
+-        uint256 indexed _id,
+-        uint256 _depositFee,
+-        uint256 _withdrawFee,
+-        uint256 _insuranceFee,
+-        uint256 _yieldFees
+-    );
+-
+-    /** @notice Emitted when an asset's duration parameters are updated
+-     * @param _id The ID of the asset
+-     * @param _duration The new main duration value in seconds
+-     * @param _yieldDuration The new yield duration value in seconds
+-     */
+-    event durationUpdateEvent(
+-        uint256 indexed _id,
+-        uint256 _duration,
+-        uint256 _yieldDuration
+-    );
+-
+-    /** @notice Emitted when an additional buffer for an asset is updated
+-     * @param _id The ID of the asset
+-     * @param _data Additional buffer data stored as bytes
+-     */
+-    event AdditionalBufferUpdateEvent(uint256 indexed _id, bytes _data);
+-
+-    /** @notice Emitted when an asset's oracle address is updated
+-     * @param _id The ID of the asset
+-     * @param _oracle The new oracle address for price feeds
+-     */
+-    event OracleUpdateEvent(uint256 indexed _id, address _oracle);
+-
+-    /** @notice Emitted when an asset's state is updated
+-     * @param _id The ID of the asset
+-     * @param _state The new state of the asset (enum AssetStatus)
+-     */
+-    event AssetStateUpdateEvent(uint256 indexed _id, AssetStatus _state);
+-
+-    /** @notice Event emitted when asset deposits are incremented
+-     * @param assetId The ID of the asset
+-     * @param amount The amount incremented
+-     */
+-    event AssetDepositIncrementEvent(uint256 indexed assetId, uint256 amount);
+-
+-    /** @notice Event emitted when asset deposits are decremented
+-     * @param assetId The ID of the asset
+-     * @param amount The amount decremented
+-     */
+-    event AssetDepositDecrementEvent(uint256 indexed assetId, uint256 amount);
+-
+-    /** @notice Event emitted when a trusted forwarder is updated
+-     * @param previousForwarder The address of the previous trusted forwarder
+-     * @param newForwarder The address of the new trusted forwarder
+-     * @dev Indicates a change in the trusted forwarder for meta-transactions
+-     */
+-    event TrustedForwarderUpdated(
+-        address indexed previousForwarder,
+-        address indexed newForwarder
+-    );
+-
+-    /**
+-     * @notice Emitted when the contract implementation is upgraded
+-     * @dev Triggered during an upgrade of the contract to a new implementation
+-     * @param newImplementation Address of the new implementation contract
+-     */
+-    event ContractUpgraded(address newImplementation);
+-
+-    /** @notice Sets the Core contract address
+-     * @dev Only callable by admin role
+-     * @param _Core The new Core contract address
+-     */
+-    function setCore(address _Core) external;
+-
+-    /** @notice Sets the treasury address
+-     * @dev Only callable by admin role
+-     * @param _treasury The new treasury address
+-     */
+-    function setTreasury(address _treasury) external;
+-
+-    /** @notice Adds a new asset to the registry
+-     * @dev Only callable by admin role
+-     * @param _name The name of the asset
+-     * @param _desc Description of the asset
+-     * @param _type Asset type identifier
+-     * @param _aggType Aggregation type flag
+-     * @return The asset ID of the newly added asset
+-     */
+-    function addAsset(
+-        string memory _name,
+-        string memory _desc,
+-        uint8 _type,
+-        bool _aggType
+-    ) external returns (uint256);
+-
+-    /** @notice Sets up an asset with contract addresses and configuration parameters
+-     * @dev Only callable by admin role and allows setting all key parameters for an asset
+-     * @param _id The unique identifier of the asset to configure
+-     * @param _contractAddr The primary token contract address for the asset
+-     * @param _issuanceAddr Address responsible for issuing the asset tokens
+-     * @param _distAddr Address of the reward distribution contract
+-     * @param _vaultAddr Address of the asset's vault contract
+-     * @param _oracle Address of the price oracle for the asset
+-     * @param _cut Percentage cut applied to the asset's transactions
+-     * @param _limit Maximum value/cap for the asset
+-     * @param _depositFee Fee charged for depositing the asset (in basis points)
+-     * @param _withdrawFee Fee charged for withdrawing the asset (in basis points)
+-     * @param _yieldFee Fee applied to yield generation (in basis points)
+-     * @param _insuranceFee Insurance fee applied (in basis points)
+-     * @param _duration Main duration parameter for protocol operations (in seconds)
+-     * @param _yieldDuration Duration specifically for yield calculations (in seconds)
+-     * @param _additionalBytes Additional configuration data stored as bytes
+-     * @custom:error Pi_SetupAlreadyDone if the asset has already been set up
+-     * @custom:error Pi_InvalidAssetSetup if the asset ID is invalid
+-     * @custom:error Pi_InvalidFeePercentage if any fee exceeds 100% (10000 basis points)
+-     * @custom:event SetupAssetEvent emitted when the asset is successfully set up
+-     */
+-    function setupAsset(
+-        uint256 _id,
+-        address _contractAddr,
+-        address _issuanceAddr,
+-        address _distAddr,
+-        address _vaultAddr,
+-        address _oracle,
+-        uint256 _cut,
+-        uint256 _limit,
+-        uint256 _depositFee,
+-        uint256 _withdrawFee,
+-        uint256 _yieldFee,
+-        uint256 _insuranceFee,
+-        uint256 _duration,
+-        uint256 _yieldDuration,
+-        bytes memory _additionalBytes
+-    ) external;
+-
+-    /** @notice Sets the cut percentage for an asset
+-     * @dev Only callable by admin role
+-     * @param _id The ID of the asset
+-     * @param _cut The new cut percentage
+-     */
+-    function setCut(uint256 _id, uint256 _cut) external;
+-
+-    /** @notice Sets the limit for an asset
+-     * @dev Only callable by admin role
+-     * @param _id The ID of the asset
+-     * @param _limit The new limit value
+-     */
+-    function setLimit(uint256 _id, uint256 _limit) external;
+-
+-    /** @notice Sets the fee structure for an asset
+-     * @dev Only callable by admin role, all fees are in basis points (10000 = 100%)
+-     * @param _id The ID of the asset
+-     * @param _depositFee The new deposit fee percentage in basis points
+-     * @param _withdrawFee The new withdrawal fee percentage in basis points
+-     * @param _yieldFee The new yield fee percentage in basis points
+-     * @param _insuranceFee The new insurance fee percentage in basis points
+-     * @custom:error Pi_InvalidFeePercentage if any fee exceeds 100% (10000 basis points)
+-     */
+-    function setFees(
+-        uint256 _id,
+-        uint256 _depositFee,
+-        uint256 _withdrawFee,
+-        uint256 _yieldFee,
+-        uint256 _insuranceFee
+-    ) external;
+-
+-    /** @notice Sets the duration parameters for a specific asset
+-     * @dev Only callable by admin role
+-     * @param _id The ID of the asset to update durations for
+-     * @param _duration The main duration parameter for the asset's operations, measured in seconds
+-     * @param _yieldduration The duration parameter specifically for yield calculations, measured in seconds
+-     */
+-    function setDurations(
+-        uint256 _id,
+-        uint256 _duration,
+-        uint256 _yieldduration
+-    ) external;
+-
+-    /** @notice Sets additional buffer data for an asset
+-     * @dev Only callable by admin role
+-     * @param _id The ID of the asset
+-     * @param _data Additional buffer data to store as bytes
+-     */
+-    function setAdditionalBuffer(uint256 _id, bytes memory _data) external;
+-
+-    /** @notice Sets the oracle address for an asset
+-     * @dev Only callable by admin role
+-     * @param _id The ID of the asset
+-     * @param _oracle The new oracle address
+-     */
+-    function setOracle(uint256 _id, address _oracle) external;
+-
+-    /** @notice Disables an asset in the registry
+-     * @dev Only callable by admin role
+-     * @param _id Asset ID to disable
+-     */
+-    function disableAsset(uint256 _id) external;
+-
+-    /** @notice Enables a previously disabled asset
+-     * @dev Only callable by admin role
+-     * @param _id Asset ID to enable
+-     */
+-    function enableAsset(uint256 _id) external;
+-
+-    /** @notice Increments the total deposits for a specific asset
+-     * @dev Only callable by admin or authorized contracts
+-     * @param _id The ID of the asset to increment deposits for
+-     * @param _amount The amount to increment deposits by
+-     */
+-    function incrementAssetDeposits(uint256 _id, uint256 _amount) external;
+-
+-    /** @notice Decrements the total deposits for a specific asset
+-     * @dev Only callable by Core contract
+-     * @param _id The ID of the asset to decrement deposits for
+-     * @param _amount The amount to decrement deposits by
+-     */
+-    function decrementAssetDeposits(uint256 _id, uint256 _amount) external;
+-
+-    /** @notice Updates the trusted forwarder address for meta-transactions
+-     * @dev Only callable by admin role, updates the address used for ERC2771 meta-transactions
+-     * @param _newForwarder The new trusted forwarder address to be used
+-     * @custom:event Emits TrustedForwarderUpdated with previous and new forwarder addresses
+-     */
+-    function updateTrustedForwarder(address _newForwarder) external;
+-
+-    /** @notice Retrieves the complete data for a specific asset
+-     * @param _id Asset ID to query
+-     * @return The AssetDefinition struct containing all asset data
+-     */
+-    function fetchAssetData(
+-        uint256 _id
+-    ) external view returns (AssetDefinition memory);
+-
+-    /** @notice Retrieves specific element of asset data based on flag
+-     * @dev Flag values: 0=name, 1=description, 2=contractType, 3=isAggregated, 4=isDisabled,
+-     *                   5=isSetup, 6=cut, 7=limit, 8=token, 9=issuer, 10=rewardDistributor, 11=vault
+-     * @param _id The ID of the asset to fetch from
+-     * @param _flag The flag indicating which element to fetch
+-     * @return The requested element value encoded as bytes
+-     */
+-    function fetchAssetElement(
+-        uint256 _id,
+-        uint8 _flag
+-    ) external view returns (bytes memory);
+-
+-    /** @notice Fetches the USST-Pegged token contract address used in the system
+-     * @dev This represents the main stablecoin contract address
+-     * @return The contract address of the USD-Pegged token
+-     */
+-    function fetchUSSTToken() external view returns (address);
+-
+-    /** @notice Fetches the USD-Interest token contract address used in the system
+-     * @dev This represents the interest-bearing stablecoin contract address
+-     * @return The contract address of the USD-Interest token
+-     */
+-    function fetchYLDToken() external view returns (address);
+-
+-    /** @notice Retrieves the Core contract address
+-     * @return The address of the Core contract
+-     */
+-    function fetchCore() external view returns (address);
+-
+-    /** @notice Retrieves the treasury address
+-     * @return The address of the treasury contract
+-     */
+-    function fetchTreasury() external view returns (address);
+-
+-    /** @notice Retrieves the current counter value
+-     * @dev The counter tracks the total number of assets added to the registry
+-     * @return The current counter value
+-     */
+-    function fetchCounter() external view returns (uint256);
+-
+-    /** @notice Retrieves the total deposit amount for a specific asset
+-     * @param _assetID The ID of the asset to query
+-     * @return The total amount deposited for the specified asset
+-     */
+-    function fetchDeposits(uint256 _assetID) external view returns (uint256);
+-
+-    /** @notice Checks if adding a deposit amount would exceed the asset's deposit limit
+-     * @param _assetID The ID of the asset to check deposit limit for
+-     * @param _amount The amount proposed to be deposited
+-     * @return True if the deposit limit would be exceeded, false otherwise
+-     */
+-    function isDepositLimitReached(
+-        uint256 _assetID,
+-        uint256 _amount
+-    ) external view returns (bool);
+-
+-    /** @notice Returns the address of the trusted forwarder for meta-transactions
+-     * @dev Used by ERC2771Context to validate meta-transaction relayers
+-     * @return The address of the current trusted forwarder
+-     */
+-    function trustedForwarder() external view returns (address);
+-}
+diff -ruN sources/STBL_PT1_Vault-OUSG//prior/contracts/lib/STBL_AssetDefinitionLib.sol sources/STBL_PT1_Vault-OUSG//current/contracts/lib/STBL_AssetDefinitionLib.sol
+--- sources/STBL_PT1_Vault-OUSG//prior/contracts/lib/STBL_AssetDefinitionLib.sol	2026-09-24 23:43:10
++++ sources/STBL_PT1_Vault-OUSG//current/contracts/lib/STBL_AssetDefinitionLib.sol	1969-12-31 21:00:00
+@@ -1,128 +0,0 @@
+-// SPDX-License-Identifier: MIT
+-pragma solidity ^0.8.20;
+-
+-import "./STBL_Structs.sol";
+-
+-/**
+- * @title STBL_AssetDefinitionLib
+- * @notice Library providing utility functions for AssetDefinition struct operations
+- * @dev This library contains pure functions for validating, checking status, and calculating fees for asset definitions
+- */
+-library STBL_AssetDefinitionLib {
+-    /**
+-     * @notice Checks if an asset definition is valid by verifying all required fields are set
+-     * @dev Validates that id is non-zero, name is not empty, and all addresses are non-zero
+-     * @param asset The asset definition to validate
+-     * @return True if the asset definition is valid, false otherwise
+-     */
+-    function isValid(
+-        AssetDefinition memory asset
+-    ) internal pure returns (bool) {
+-        return
+-            asset.id != 0 &&
+-            bytes(asset.name).length > 0 &&
+-            asset.token != address(0) &&
+-            asset.issuer != address(0) &&
+-            asset.rewardDistributor != address(0) &&
+-            asset.vault != address(0);
+-    }
+-
+-    /**
+-     * @notice Checks if an asset is active and available for use
+-     * @dev An asset is considered active if it's setup and not disabled
+-     * @param asset The asset definition to check
+-     * @return True if the asset is active, false otherwise
+-     */
+-    function isActive(
+-        AssetDefinition memory asset
+-    ) internal pure returns (bool) {
+-        return asset.status == AssetStatus.ENABLED;
+-    }
+-
+-    /**
+-     * @notice Calculates yield fees for a given amount
+-     * @dev Calculates yield fee for given amount based on asset configuration using basis points (10000 = 100%)
+-     * @param asset The asset definition with yield fee configuration
+-     * @param amount The amount to calculate yield fee for
+-     * @return netAmount The amount after deducting yield fee
+-     * @return yieldFee The calculated yield fee amount
+-     */
+-    function calculateYieldFee(
+-        AssetDefinition memory asset,
+-        uint256 amount
+-    ) internal pure returns (uint256, uint256) {
+-        uint256 yieldFee = (amount * asset.yieldFees) / FEES_CONSTANT; // Assuming fee is in basis points
+-        return (amount - yieldFee, yieldFee);
+-    }
+-
+-    /**
+-     * @notice Checks if an address matches the token address of an asset
+-     * @dev Compares the provided account address with the asset's token address
+-     * @param asset The asset definition to check
+-     * @param account The address to compare
+-     * @return True if the address matches the token address, false otherwise
+-     */
+-    function isToken(
+-        AssetDefinition memory asset,
+-        address account
+-    ) internal pure returns (bool) {
+-        return account == asset.token;
+-    }
+-
+-    /**
+-     * @notice Checks if an address matches the vault address of an asset
+-     * @dev Compares the provided account address with the asset's vault address
+-     * @param asset The asset definition to check
+-     * @param account The address to compare
+-     * @return True if the address matches the vault address, false otherwise
+-     */
+-    function isVault(
+-        AssetDefinition memory asset,
+-        address account
+-    ) internal pure returns (bool) {
+-        return account == asset.vault;
+-    }
+-
+-    /**
+-     * @notice Checks if an address matches the issuer address of an asset
+-     * @dev Compares the provided account address with the asset's issuer address
+-     * @param asset The asset definition to check
+-     * @param account The address to compare
+-     * @return True if the address matches the issuer address, false otherwise
+-     */
+-    function isIssuer(
+-        AssetDefinition memory asset,
+-        address account
+-    ) internal pure returns (bool) {
+-        return account == asset.issuer;
+-    }
+-
+-    /**
+-     * @notice Checks if an address matches the reward distributor address of an asset
+-     * @dev Compares the provided account address with the asset's reward distributor address
+-     * @param asset The asset definition to check
+-     * @param account The address to compare
+-     * @return True if the address matches the reward distributor address, false otherwise
+-     */
+-    function isDistributor(
+-        AssetDefinition memory asset,
+-        address account
+-    ) internal pure returns (bool) {
+-        return account == asset.rewardDistributor;
+-    }
+-
+-    /**
+-     * @notice Creates a string representation of the asset's contract type
+-     * @dev Maps numeric contract type to human-readable string representation
+-     * @param asset The asset definition
+-     * @return The contract type as a string ("ERC20", "ERC721", "Custom", or "Unknown")
+-     */
+-    function getContractTypeString(
+-        AssetDefinition memory asset
+-    ) internal pure returns (string memory) {
+-        if (asset.contractType == 0) return "ERC20";
+-        if (asset.contractType == 1) return "ERC721";
+-        if (asset.contractType == 2) return "Custom";
+-        return "Unknown";
+-    }
+-}
+diff -ruN sources/STBL_PT1_Vault-OUSG//prior/contracts/lib/STBL_DecimalConverter.sol sources/STBL_PT1_Vault-OUSG//current/contracts/lib/STBL_DecimalConverter.sol
+--- sources/STBL_PT1_Vault-OUSG//prior/contracts/lib/STBL_DecimalConverter.sol	2026-09-24 23:43:10
++++ sources/STBL_PT1_Vault-OUSG//current/contracts/lib/STBL_DecimalConverter.sol	1969-12-31 21:00:00
+@@ -1,127 +0,0 @@
+-// SPDX-License-Identifier: MIT
+-pragma solidity ^0.8.0;
+-
+-/**
+- * @title DecimalConverter
+- * @dev Library for converting token amounts between different decimal representations
+- * @notice Provides utility functions for handling decimal conversions between ERC20 tokens
+- * @author Smart Contract Developer
+- */
+-library DecimalConverter {
+-    /**
+-     * @dev Convert token amount from source decimal to target decimal
+-     * @notice Converts token amounts between different decimal precisions without overflow protection
+-     * @param amount The token amount to convert
+-     * @param sourceDecimals Decimal places of the source token (e.g., 6 for USDC)
+-     * @param targetDecimals Decimal places of the target token (e.g., 18 for ETH)
+-     * @return convertedAmount Converted token amount in target decimal precision
+-     */
+-    function convertDecimals(
+-        uint256 amount,
+-        uint8 sourceDecimals,
+-        uint8 targetDecimals
+-    ) internal pure returns (uint256 convertedAmount) {
+-        // If decimals are the same, return original amount
+-        if (sourceDecimals == targetDecimals) {
+-            return amount;
+-        }
+-
+-        // Handle conversion based on decimal difference
+-        if (sourceDecimals > targetDecimals) {
+-            // Reduce precision
+-            uint256 decimalDifference = sourceDecimals - targetDecimals;
+-            return amount / (10 ** decimalDifference);
+-        } else {
+-            // Increase precision
+-            uint256 decimalDifference = targetDecimals - sourceDecimals;
+-            return amount * (10 ** decimalDifference);
+-        }
+-    }
+-
+-    /**
+-     * @dev Safely convert token amount with overflow protection
+-     * @notice Converts token amounts between different decimal precisions with overflow protection
+-     * @param amount The token amount to convert
+-     * @param sourceDecimals Decimal places of the source token (e.g., 6 for USDC)
+-     * @param targetDecimals Decimal places of the target token (e.g., 18 for ETH)
+-     * @return convertedAmount Converted token amount in target decimal precision
+-     * @custom:reverts "Decimal conversion would cause overflow" if multiplication would overflow uint256
+-     */
+-    function safeConvertDecimals(
+-        uint256 amount,
+-        uint8 sourceDecimals,
+-        uint8 targetDecimals
+-    ) internal pure returns (uint256 convertedAmount) {
+-        // If decimals are the same, return original amount
+-        if (sourceDecimals == targetDecimals) {
+-            return amount;
+-        }
+-
+-        // Handle conversion based on decimal difference
+-        if (sourceDecimals > targetDecimals) {
+-            // Reduce precision
+-            uint256 decimalDifference = sourceDecimals - targetDecimals;
+-            return amount / (10 ** decimalDifference);
+-        } else {
+-            // Increase precision with overflow check
+-            uint256 decimalDifference = targetDecimals - sourceDecimals;
+-
+-            // Check for potential overflow
+-            if (amount > type(uint256).max / (10 ** decimalDifference)) {
+-                revert("Decimal conversion would cause overflow");
+-            }
+-
+-            return amount * (10 ** decimalDifference);
+-        }
+-    }
+-
+-    /**
+-     * @dev Get normalized amount based on standard 18 decimals
+-     * @notice Converts any token amount to 18 decimal precision for standardized calculations
+-     * @param amount Token amount to normalize in its native decimal precision
+-     * @param tokenDecimals Decimal places of the token (e.g., 6 for USDC, 8 for WBTC)
+-     * @return normalizedAmount Normalized amount in 18 decimal precision
+-     */
+-    function normalizeToDecimals18(
+-        uint256 amount,
+-        uint8 tokenDecimals
+-    ) internal pure returns (uint256 normalizedAmount) {
+-        return convertDecimals(amount, tokenDecimals, 18);
+-    }
+-
+-    /**
+-     * @dev Convert 18 decimal amount to specific token decimals
+-     * @notice Converts standardized 18 decimal amounts back to token's native decimal precision
+-     * @param amount Amount in 18 decimal precision
+-     * @param tokenDecimals Target token decimal places (e.g., 6 for USDC, 8 for WBTC)
+-     * @return convertedAmount Converted amount in target token's native decimal precision
+-     */
+-    function convertFrom18Decimals(
+-        uint256 amount,
+-        uint8 tokenDecimals
+-    ) internal pure returns (uint256 convertedAmount) {
+-        return convertDecimals(amount, 18, tokenDecimals);
+-    }
+-
+-    /**
+-     * @dev Get token's native decimal precision
+-     * @notice Retrieves the decimal precision of an ERC20 token via low-level call
+-     * @param tokenAddress Address of the ERC20 token contract
+-     * @return decimals Token's decimal places (defaults to 18 if call fails)
+-     */
+-    function getTokenDecimals(
+-        address tokenAddress
+-    ) internal view returns (uint8 decimals) {
+-        // Create minimal interface for decimals
+-        (bool success, bytes memory data) = tokenAddress.staticcall(
+-            abi.encodeWithSignature("decimals()")
+-        );
+-
+-        // Return 18 as default if call fails
+-        if (!success || data.length == 0) {
+-            return 18;
+-        }
+-
+-        return abi.decode(data, (uint8));
+-    }
+-}
+diff -ruN sources/STBL_PT1_Vault-OUSG//prior/contracts/lib/STBL_Errors.sol sources/STBL_PT1_Vault-OUSG//current/contracts/lib/STBL_Errors.sol
+--- sources/STBL_PT1_Vault-OUSG//prior/contracts/lib/STBL_Errors.sol	2026-09-24 23:43:10
++++ sources/STBL_PT1_Vault-OUSG//current/contracts/lib/STBL_Errors.sol	1969-12-31 21:00:00
+@@ -1,141 +0,0 @@
+-// SPDX-License-Identifier: MIT
+-pragma solidity ^0.8.20;
+-
+-/**
+- * @notice Thrown when an unauthorized caller attempts to access a restricted function
+- */
+-error STBL_UnauthorizedCaller();
+-
+-/**
+- * @notice Thrown when attempting to set up an asset with invalid parameters
+- */
+-error STBL_InvalidAssetSetup();
+-
+-/**
+- * @notice Thrown when attempting to set up an asset with invalid parameters
+- */
+-error STBL_InvalidAssetName();
+-
+-/**
+- * @notice Thrown when the setup has already been completed
+- */
+-error STBL_SetupAlreadyDone();
+-
+-/**
+- * @notice Thrown when an asset is not active
+- */
+-error STBL_AssetNotActive();
+-
+-/**
+- * @notice Thrown when an asset is active
+- */
+-error STBL_AssetActive();
+-
+-/**
+- * @notice Thrown when an invalid address is provided
+- */
+-error STBL_InvalidAddress();
+-
+-/**
+- * @notice Thrown when an invalid Yield Duration and duration are provided
+- */
+-error STBL_InvalidDuration();
+-
+-/**
+- * @notice Thrown when an invalid treasury address is provided
+- */
+-error STBL_InvalidTreasury();
+-
+-/**
+- * @notice Thrown when an unauthorized issuer attempts an operation
+- */
+-error STBL_UnauthorizedIssuer();
+-
+-/**
+- * @notice Thrown when an invalid cut percentage is provided
+- * @param cut The invalid cut percentage that was provided
+- */
+-error STBL_InvalidCutPercentage(uint256 cut);
+-
+-/**
+- * @notice Thrown when a maximum limit has been reached
+- */
+-error STBL_MaxLimitReached();
+-
+-/**
+- * @notice Thrown when YLD functionality is disabled
+- * @param id The ID of the YLD that is disabled
+- */
+-error STBL_YLDDisabled(uint256 id);
+-
+-/**
+- * @notice Thrown when an invalid flag value is provided
+- * @param flag The invalid flag value that was provided
+- */
+-error STBL_InvalidFlagValue(uint8 flag);
+-
+-/**
+- * @notice Thrown when attempting to disable an already disabled asset
+- * @param id The ID of the asset that is already disabled
+- */
+-error STBL_AssetDisabled(uint256 id);
+-
+-/**
+- * @notice Thrown when attempting to enable an already enabled asset
+- * @param id The ID of the asset that is already enabled
+- */
+-error STBL_AssetEnabled(uint256 id);
+-
+-/**
+- * @notice Thrown when an invalid fee percentage is provided
+- * @param fee The invalid fee percentage that was provided
+- */
+-error STBL_InvalidFeePercentage(uint256 fee);
+-
+-/**
+- * @notice Thrown when attempting to disable an already disabled insurance
+- * @param id The ID of the insurance that is already disabled
+- */
+-error STBL_IssuanceAlreadyDisabled(uint256 id);
+-
+-/**
+- * @notice Thrown when attempting to enable an already enabled insurance
+- * @param id The ID of the insurance that is already enabled
+- */
+-error STBL_IssuanceAlreadyEnabled(uint256 id);
+-
+-/**
+- * @notice Thrown when the caller is not the owner of the NFT
+- * @param tokenId The ID of the token for which ownership is required
+- */
+-error STBL_YLD_NotOwner(uint256 tokenId);
+-
+-/**
+- * @notice Thrown when attempting to enable an already enabled NFT
+- * @param tokenId The ID of the token that is already enabled
+- */
+-error STBL_YLD_AlreadyEnabled(uint256 tokenId);
+-
+-/**
+- * @notice Thrown when attempting to disable an already disabled NFT
+- * @param tokenId The ID of the token that is already disabled
+- */
+-error STBL_YLD_AlreadyDisabled(uint256 tokenId);
+-
+-/**
+- * @notice Thrown when attempting to transfer a token that has transfers disabled
+- * @param tokenId The ID of the token that cannot be transferred
+- */
+-error STBL_YLD_TransferDisabled(uint256 tokenId);
+-
+-/**
+- * @notice Thrown when the sender address is blacklisted
+- * @param sender The blacklisted sender address
+- */
+-error STBL_USST_SenderBlacklisted(address sender);
+-
+-/**
+- * @notice Thrown when the recipient address is blacklisted
+- * @param recipient The blacklisted recipient address
+- */
+-error STBL_USST_RecipientBlacklisted(address recipient);
+diff -ruN sources/STBL_PT1_Vault-OUSG//prior/contracts/lib/STBL_Structs.sol sources/STBL_PT1_Vault-OUSG//current/contracts/lib/STBL_Structs.sol
+--- sources/STBL_PT1_Vault-OUSG//prior/contracts/lib/STBL_Structs.sol	2026-09-24 23:43:10
++++ sources/STBL_PT1_Vault-OUSG//current/contracts/lib/STBL_Structs.sol	1969-12-31 21:00:00
+@@ -1,176 +0,0 @@
+-// SPDX-License-Identifier: MIT
+-pragma solidity ^0.8.20;
+-
+-/**
+- * @title STBL Protocol Structs
+- * @notice Core data structures used throughout the STBL Protocol
+- * @dev This file contains all the essential data structures that define the protocol's architecture
+- */
+-
+-/**
+- * @title YLD_Metadata
+- * @notice Metadata structure for yield-bearing tokens
+- * @dev Stores essential information about yield tokens including values, fees, and operational state
+- */
+-struct YLD_Metadata {
+-    /** @notice Unique identifier for the asset */
+-    uint256 assetID;
+-    /** @notice URI pointing to token metadata following standard metadata format */
+-    string uri;
+-    /** @notice Value representing the amount of the asset deposited in native asset units */
+-    uint256 assetValue;
+-    /** @notice The total USD value of tokens deposited in the protocol before any adjustments */
+-    uint256 stableValueGross;
+-    /** @notice The net USD value of USP tokens minted by the protocol after applying haircuts and fees */
+-    uint256 stableValueNet;
+-    /** @notice Block Timestamp when the deposit was made for time-based calculations */
+-    uint256 depositTimestamp;
+-    /** @notice Absolute fee amount charged on asset deposits in wei */
+-    uint256 depositfeeAmount;
+-    /** @notice Absolute haircut amount taken in USD terms as protocol fee */
+-    uint256 haircutAmount;
+-    /** @notice Absolute haircut amount taken in asset terms as protocol fee */
+-    uint256 haircutAmountAssetValue;
+-    /** @notice Absolute fee amount charged on asset withdrawals in wei */
+-    uint256 withdrawfeeAmount;
+-    /** @notice Absolute fee amount allocated to insurance pool in wei */
+-    uint256 insurancefeeAmount;
+-    /** @notice Snapshot of fee structure at the time of deposit for consistency */
+-    FeeStruct Fees;
+-    /** @notice Additional data buffer for future extensibility and upgrades */
+-    bytes additionalBuffer;
+-    /** @notice Flag indicating if token is disabled and cannot be used */
+-    bool isDisabled;
+-}
+-
+-/**
+- * @title AssetStatus
+- * @notice Enumeration defining the operational status of assets within the protocol
+- * @dev Used to track asset lifecycle and control operational permissions
+- * @param INACTIVE Asset is not yet configured or deployed
+- * @param INITIALIZED Asset is configured but not yet active for operations
+- * @param ENABLED Asset is fully operational and available for deposits/withdrawals
+- * @param DISABLED Asset is temporarily disabled but can be reactivated
+- * @param EMERGENCY_STOP Asset is in emergency state with all operations halted
+- */
+-enum AssetStatus {
+-    INACTIVE,
+-    INITIALIZED,
+-    ENABLED,
+-    DISABLED,
+-    EMERGENCY_STOP
+-}
+-
+-/**
+- * @title AssetDefinition
+- * @notice Structure defining comprehensive properties of an asset in the protocol
+- * @dev Contains all configuration parameters, addresses, and operational settings for an asset
+- */
+-struct AssetDefinition {
+-    /** @notice Unique identifier assigned to the asset within the protocol */
+-    uint256 id;
+-    /** @notice Human-readable name of the asset for display purposes */
+-    string name;
+-    /** @notice Detailed description of the asset and its characteristics */
+-    string description;
+-    /** @notice Type of contract (ERC20 = 0, ERC721 = 1, Custom = 2) */
+-    uint8 contractType;
+-    /** @notice Flag indicating if yields are aggregated for this asset across all deposits */
+-    bool isAggreagated;
+-    /** @notice Current operational status of the asset (INACTIVE, INITIALIZED, ENABLED, DISABLED) */
+-    AssetStatus status;
+-    /** @notice Haircut percentage taken by the protocol in basis points */
+-    uint256 cut;
+-    /** @notice Maximum allowable deposit amount for this asset in native units */
+-    uint256 limit;
+-    /** @notice Contract address of the underlying token */
+-    address token;
+-    /** @notice Address responsible for asset issuance and management */
+-    address issuer;
+-    /** @notice Address responsible for distributing rewards to token holders */
+-    address rewardDistributor;
+-    /** @notice Address of the oracle providing price feeds and market data */
+-    address oracle;
+-    /** @notice Address of the custodian vault holding the actual assets */
+-    address vault;
+-    /** @notice Fee percentage charged on deposits in basis points */
+-    uint256 depositFees;
+-    /** @notice Fee percentage charged on withdrawals in basis points */
+-    uint256 withdrawFees;
+-    /** @notice Fee percentage charged on yield generation in basis points */
+-    uint256 yieldFees;
+-    /** @notice Percentage of fees allocated to insurance pool in basis points */
+-    uint256 insuranceFees;
+-    /** @notice Time duration in seconds for which asset must remain locked post deposit */
+-    uint256 duration;
+-    /** @notice Time interval in seconds between yield distribution events */
+-    uint256 yieldDuration;
+-    /** @notice Additional data buffer for future extensibility and protocol upgrades */
+-    bytes additionalBuffer;
+-}
+-
+-/**
+- * @title stakingStruct
+- * @notice Data structure tracking token staking details for protocol participants
+- * @dev Used to manage individual staking positions, rewards, and distribution tracking
+- * @custom:security Balance must never underflow, implement proper checks before withdrawals
+- * @custom:security RewardIndex must be properly synchronized with global reward calculations
+- */
+-struct stakingStruct {
+-    /** @notice Current staked balance of the participant in wei */
+-    uint256 balance;
+-    /** @notice Index tracking participant's position in yield distribution calculations */
+-    uint256 rewardIndex;
+-    /** @notice Total rewards earned but not yet claimed by the participant */
+-    uint256 earned;
+-    /** @notice Flag indicating if staking position is currently active and earning rewards */
+-    bool isActive;
+-}
+-
+-/**
+- * @title VaultStruct
+- * @notice Structure tracking protocol vault metrics and cumulative financial data
+- * @dev Comprehensive record of all fees, deposits, and protocol revenue streams
+- * @custom:security All fee calculations must prevent overflow and maintain precision
+- */
+-struct VaultStruct {
+-    /** @notice Total accumulated fees from asset deposits across all assets */
+-    uint256 depositFees;
+-    /** @notice Total accumulated fees from asset withdrawals across all assets */
+-    uint256 withdrawFees;
+-    /** @notice Total accumulated fees from insurance contributions */
+-    uint256 insuranceFees;
+-    /** @notice Total accumulated fees from yield generation activities */
+-    uint256 yieldFees;
+-    /** @notice Cumulative total of all haircut fees collected by protocol in USD */
+-    uint256 cumilativeHairCutValue;
+-    /** @notice Current USD value of all deposits held in the vault */
+-    uint256 depositValueUSD;
+-    /** @notice Total gross value of asset deposits before any deductions */
+-    uint256 assetDepositGross;
+-    /** @notice Net value of asset deposits after haircuts and fees are applied */
+-    uint256 assetDepositNet;
+-}
+-
+-/**
+- * @title FeeStruct
+- * @notice Structure defining fee configuration for various protocol operations
+- * @dev Contains granular fee settings and timing parameters for protocol actions
+- * @custom:security All fee percentages should be validated to prevent excessive fees
+- */
+-struct FeeStruct {
+-    /** @notice Fee percentage charged on asset deposits in basis points */
+-    uint256 depositFee;
+-    /** @notice Percentage of deposit value taken as protocol haircut in basis points */
+-    uint256 hairCut;
+-    /** @notice Fee percentage charged on asset withdrawals in basis points */
+-    uint256 withdrawFee;
+-    /** @notice Percentage of total fees allocated to insurance pool in basis points */
+-    uint256 insuranceFee;
+-    /** @notice Lock duration in seconds for deposited assets */
+-    uint256 duration;
+-    /** @notice Time interval in seconds between yield distribution events */
+-    uint256 yieldDuration;
+-}
+-
+-uint256 constant FEES_CONSTANT = 10 ** 9;
+diff -ruN sources/STBL_PT1_Vault-OUSG//prior/node_modules/@stbl-protocol/stbl-contracts-evm-core/contracts/interfaces/ISTBL_Core.sol sources/STBL_PT1_Vault-OUSG//current/node_modules/@stbl-protocol/stbl-contracts-evm-core/contracts/interfaces/ISTBL_Core.sol
+--- sources/STBL_PT1_Vault-OUSG//prior/node_modules/@stbl-protocol/stbl-contracts-evm-core/contracts/interfaces/ISTBL_Core.sol	1969-12-31 21:00:00
++++ sources/STBL_PT1_Vault-OUSG//current/node_modules/@stbl-protocol/stbl-contracts-evm-core/contracts/interfaces/ISTBL_Core.sol	2026-09-24 23:43:09
+@@ -0,0 +1,108 @@
++// SPDX-License-Identifier: MIT
++pragma solidity ^0.8.20;
++
++import "../lib/STBL_Structs.sol";
++
++/**
++ * @title STBL Core Interface
++ * @notice Interface for core functionality of the STBL Protocol
++ * @dev Defines the main entry and exit points for assets in the protocol
++ */
++interface iSTBL_Core {
++    /**
++     * @notice Emitted when an asset is deposited into the protocol
++     * @param _id The asset identifier
++     * @param _to Address receiving the minted token
++     * @param _metadata Metadata associated with the YLD token
++     * @param _tokenID ID of the minted token
++     */
++    event putEvent(
++        uint256 indexed _id,
++        address indexed _to,
++        YLD_Metadata _metadata,
++        uint256 _tokenID
++    );
++
++    /**
++     * @notice Emitted when an asset is withdrawn from the protocol
++     * @param _id The asset identifier
++     * @param _to Address receiving the withdrawn assets
++     * @param _value The value of the withdrawn assets
++     * @param _tokenID ID of the burned token
++     */
++    event exitEvent(
++        uint256 indexed _id,
++        address indexed _to,
++        uint256 _value,
++        uint256 _tokenID
++    );
++
++    /**
++     * @notice Event emitted when a trusted forwarder is updated
++     * @param previousForwarder The address of the previous trusted forwarder
++     * @param newForwarder The address of the new trusted forwarder
++     * @dev Indicates a change in the trusted forwarder for meta-transactions
++     */
++    event TrustedForwarderUpdated(
++        address indexed previousForwarder,
++        address indexed newForwarder
++    );
++
++    /**
++     * @notice Emitted when the contract implementation is upgraded
++     * @dev Triggered during an upgrade of the contract to a new implementation
++     * @param newImplementation Address of the new implementation contract
++     */
++    event ContractUpgraded(address newImplementation);
++
++    /**
++     * @notice Method to update trusted forwarder
++     * @param _newForwarder Address of the new trusted forwarder
++     * @dev Only callable by admin
++     */
++    function updateTrustedForwarder(address _newForwarder) external;
++
++    /**
++     * @notice Issues X and Y tokens for a given asset
++     * @dev Only callable by the asset issuer
++     * @param _to Address to receive the tokens
++     * @param _metadata Metadata associated with the YLD Token
++     * @return nftID The ID of the minted Y token (NFT)
++     */
++    function put(
++        address _to,
++        YLD_Metadata memory _metadata
++    ) external returns (uint256);
++
++    /**
++     * @notice Withdraws assets from the protocol
++     * @param _assetID The identifier of the asset being withdrawn
++     * @param _from Address that owns the token being burned
++     * @param _tokenID ID of the token to burn
++     * @param _value The amount of X tokens to burn during redemption
++     */
++    function exit(
++        uint256 _assetID,
++        address _from,
++        uint256 _tokenID,
++        uint256 _value
++    ) external;
++
++    /**
++     * @notice Retrieves the USP token address
++     * @return The address of the USP token contract
++     */
++    function fetchUSPToken() external view returns (address);
++
++    /**
++     * @notice Retrieves the USI token address
++     * @return The address of the USI token contract
++     */
++    function fetchUSIToken() external view returns (address);
++
++    /**
++     * @notice Retrieves the registry address
++     * @return The address of the registry contract
++     */
++    function fetchRegistry() external view returns (address);
++}
+diff -ruN sources/STBL_PT1_Vault-OUSG//prior/node_modules/@stbl-protocol/stbl-contracts-evm-core/contracts/interfaces/ISTBL_Register.sol sources/STBL_PT1_Vault-OUSG//current/node_modules/@stbl-protocol/stbl-contracts-evm-core/contracts/interfaces/ISTBL_Register.sol
+--- sources/STBL_PT1_Vault-OUSG//prior/node_modules/@stbl-protocol/stbl-contracts-evm-core/contracts/interfaces/ISTBL_Register.sol	1969-12-31 21:00:00
++++ sources/STBL_PT1_Vault-OUSG//current/node_modules/@stbl-protocol/stbl-contracts-evm-core/contracts/interfaces/ISTBL_Register.sol	2026-09-24 23:43:09
+@@ -0,0 +1,346 @@
++// SPDX-License-Identifier: MIT
++pragma solidity ^0.8.20;
++
++import "@openzeppelin/contracts/access/IAccessControl.sol";
++import "../lib/STBL_Structs.sol";
++
++/** @title STBL Register Interface
++ * @notice Interface for managing asset registrations and configurations in the STBL protocol
++ * @dev Inherits from OpenZeppelin's IAccessControl for role-based access control
++ */
++interface iSTBL_Register is IAccessControl {
++    /** @notice Emitted when the Core contract address is updated
++     * @param _Core The new Core contract address
++     */
++    event CoreUpdateEvent(address _Core);
++
++    /** @notice Emitted when the treasury address is updated
++     * @param _treasury The new treasury address
++     */
++    event TreasuryUpdateEvent(address _treasury);
++
++    /** @notice Emitted when a new asset is added to the registry
++     * @param _id The ID of the added asset
++     * @param _Assetdata The asset definition data
++     */
++    event AddAssetEvent(uint256 indexed _id, AssetDefinition _Assetdata);
++
++    /** @notice Emitted when an asset is setup with contract addresses and configuration
++     * @param _id The ID of the setup asset
++     * @param _Assetdata The complete asset definition containing all configuration parameters including
++     * contract addresses, fee structures, limits, and durations
++     */
++    event SetupAssetEvent(uint256 indexed _id, AssetDefinition _Assetdata);
++
++    /** @notice Emitted when an asset's cut percentage is updated
++     * @param _id The ID of the asset
++     * @param _cut The new cut percentage value
++     */
++    event CutUpdateEvent(uint256 indexed _id, uint256 _cut);
++
++    /** @notice Emitted when an asset's limit is updated
++     * @param _id The ID of the asset
++     * @param _limit The new limit value
++     */
++    event LimitUpdateEvent(uint256 indexed _id, uint256 _limit);
++
++    /** @notice Emitted when an asset's fees are updated
++     * @param _id The ID of the asset
++     * @param _depositFee The new deposit fee value in basis points
++     * @param _withdrawFee The new withdrawal fee value in basis points
++     * @param _insuranceFee The new insurance fee value in basis points
++     * @param _yieldFees The new yield fee value in basis points
++     */
++    event FeeUpdateEvent(
++        uint256 indexed _id,
++        uint256 _depositFee,
++        uint256 _withdrawFee,
++        uint256 _insuranceFee,
++        uint256 _yieldFees
++    );
++
++    /** @notice Emitted when an asset's duration parameters are updated
++     * @param _id The ID of the asset
++     * @param _duration The new main duration value in seconds
++     * @param _yieldDuration The new yield duration value in seconds
++     */
++    event durationUpdateEvent(
++        uint256 indexed _id,
++        uint256 _duration,
++        uint256 _yieldDuration
++    );
++
++    /** @notice Emitted when an additional buffer for an asset is updated
++     * @param _id The ID of the asset
++     * @param _data Additional buffer data stored as bytes
++     */
++    event AdditionalBufferUpdateEvent(uint256 indexed _id, bytes _data);
++
++    /** @notice Emitted when an asset's oracle address is updated
++     * @param _id The ID of the asset
++     * @param _oracle The new oracle address for price feeds
++     */
++    event OracleUpdateEvent(uint256 indexed _id, address _oracle);
++
++    /** @notice Emitted when an asset's state is updated
++     * @param _id The ID of the asset
++     * @param _state The new state of the asset (enum AssetStatus)
++     */
++    event AssetStateUpdateEvent(uint256 indexed _id, AssetStatus _state);
++
++    /** @notice Event emitted when asset deposits are incremented
++     * @param assetId The ID of the asset
++     * @param amount The amount incremented
++     */
++    event AssetDepositIncrementEvent(uint256 indexed assetId, uint256 amount);
++
++    /** @notice Event emitted when asset deposits are decremented
++     * @param assetId The ID of the asset
++     * @param amount The amount decremented
++     */
++    event AssetDepositDecrementEvent(uint256 indexed assetId, uint256 amount);
++
++    /** @notice Event emitted when a trusted forwarder is updated
++     * @param previousForwarder The address of the previous trusted forwarder
++     * @param newForwarder The address of the new trusted forwarder
++     * @dev Indicates a change in the trusted forwarder for meta-transactions
++     */
++    event TrustedForwarderUpdated(
++        address indexed previousForwarder,
++        address indexed newForwarder
++    );
++
++    /**
++     * @notice Emitted when the contract implementation is upgraded
++     * @dev Triggered during an upgrade of the contract to a new implementation
++     * @param newImplementation Address of the new implementation contract
++     */
++    event ContractUpgraded(address newImplementation);
++
++    /** @notice Sets the Core contract address
++     * @dev Only callable by admin role
++     * @param _Core The new Core contract address
++     */
++    function setCore(address _Core) external;
++
++    /** @notice Sets the treasury address
++     * @dev Only callable by admin role
++     * @param _treasury The new treasury address
++     */
++    function setTreasury(address _treasury) external;
++
++    /** @notice Adds a new asset to the registry
++     * @dev Only callable by admin role
++     * @param _name The name of the asset
++     * @param _desc Description of the asset
++     * @param _type Asset type identifier
++     * @param _aggType Aggregation type flag
++     * @return The asset ID of the newly added asset
++     */
++    function addAsset(
++        string memory _name,
++        string memory _desc,
++        uint8 _type,
++        bool _aggType
++    ) external returns (uint256);
++
++    /** @notice Sets up an asset with contract addresses and configuration parameters
++     * @dev Only callable by admin role and allows setting all key parameters for an asset
++     * @param _id The unique identifier of the asset to configure
++     * @param _contractAddr The primary token contract address for the asset
++     * @param _issuanceAddr Address responsible for issuing the asset tokens
++     * @param _distAddr Address of the reward distribution contract
++     * @param _vaultAddr Address of the asset's vault contract
++     * @param _oracle Address of the price oracle for the asset
++     * @param _cut Percentage cut applied to the asset's transactions
++     * @param _limit Maximum value/cap for the asset
++     * @param _depositFee Fee charged for depositing the asset (in basis points)
++     * @param _withdrawFee Fee charged for withdrawing the asset (in basis points)
++     * @param _yieldFee Fee applied to yield generation (in basis points)
++     * @param _insuranceFee Insurance fee applied (in basis points)
++     * @param _duration Main duration parameter for protocol operations (in seconds)
++     * @param _yieldDuration Duration specifically for yield calculations (in seconds)
++     * @param _additionalBytes Additional configuration data stored as bytes
++     * @custom:error Pi_SetupAlreadyDone if the asset has already been set up
++     * @custom:error Pi_InvalidAssetSetup if the asset ID is invalid
++     * @custom:error Pi_InvalidFeePercentage if any fee exceeds 100% (10000 basis points)
++     * @custom:event SetupAssetEvent emitted when the asset is successfully set up
++     */
++    function setupAsset(
++        uint256 _id,
++        address _contractAddr,
++        address _issuanceAddr,
++        address _distAddr,
++        address _vaultAddr,
++        address _oracle,
++        uint256 _cut,
++        uint256 _limit,
++        uint256 _depositFee,
++        uint256 _withdrawFee,
++        uint256 _yieldFee,
++        uint256 _insuranceFee,
++        uint256 _duration,
++        uint256 _yieldDuration,
++        bytes memory _additionalBytes
++    ) external;
++
++    /** @notice Sets the cut percentage for an asset
++     * @dev Only callable by admin role
++     * @param _id The ID of the asset
++     * @param _cut The new cut percentage
++     */
++    function setCut(uint256 _id, uint256 _cut) external;
++
++    /** @notice Sets the limit for an asset
++     * @dev Only callable by admin role
++     * @param _id The ID of the asset
++     * @param _limit The new limit value
++     */
++    function setLimit(uint256 _id, uint256 _limit) external;
++
++    /** @notice Sets the fee structure for an asset
++     * @dev Only callable by admin role, all fees are in basis points (10000 = 100%)
++     * @param _id The ID of the asset
++     * @param _depositFee The new deposit fee percentage in basis points
++     * @param _withdrawFee The new withdrawal fee percentage in basis points
++     * @param _yieldFee The new yield fee percentage in basis points
++     * @param _insuranceFee The new insurance fee percentage in basis points
++     * @custom:error Pi_InvalidFeePercentage if any fee exceeds 100% (10000 basis points)
++     */
++    function setFees(
++        uint256 _id,
++        uint256 _depositFee,
++        uint256 _withdrawFee,
++        uint256 _yieldFee,
++        uint256 _insuranceFee
++    ) external;
++
++    /** @notice Sets the duration parameters for a specific asset
++     * @dev Only callable by admin role
++     * @param _id The ID of the asset to update durations for
++     * @param _duration The main duration parameter for the asset's operations, measured in seconds
++     * @param _yieldduration The duration parameter specifically for yield calculations, measured in seconds
++     */
++    function setDurations(
++        uint256 _id,
++        uint256 _duration,
++        uint256 _yieldduration
++    ) external;
++
++    /** @notice Sets additional buffer data for an asset
++     * @dev Only callable by admin role
++     * @param _id The ID of the asset
++     * @param _data Additional buffer data to store as bytes
++     */
++    function setAdditionalBuffer(uint256 _id, bytes memory _data) external;
++
++    /** @notice Sets the oracle address for an asset
++     * @dev Only callable by admin role
++     * @param _id The ID of the asset
++     * @param _oracle The new oracle address
++     */
++    function setOracle(uint256 _id, address _oracle) external;
++
++    /** @notice Disables an asset in the registry
++     * @dev Only callable by admin role
++     * @param _id Asset ID to disable
++     */
++    function disableAsset(uint256 _id) external;
++
++    /** @notice Enables a previously disabled asset
++     * @dev Only callable by admin role
++     * @param _id Asset ID to enable
++     */
++    function enableAsset(uint256 _id) external;
++
++    /** @notice Increments the total deposits for a specific asset
++     * @dev Only callable by admin or authorized contracts
++     * @param _id The ID of the asset to increment deposits for
++     * @param _amount The amount to increment deposits by
++     */
++    function incrementAssetDeposits(uint256 _id, uint256 _amount) external;
++
++    /** @notice Decrements the total deposits for a specific asset
++     * @dev Only callable by Core contract
++     * @param _id The ID of the asset to decrement deposits for
++     * @param _amount The amount to decrement deposits by
++     */
++    function decrementAssetDeposits(uint256 _id, uint256 _amount) external;
++
++    /** @notice Updates the trusted forwarder address for meta-transactions
++     * @dev Only callable by admin role, updates the address used for ERC2771 meta-transactions
++     * @param _newForwarder The new trusted forwarder address to be used
++     * @custom:event Emits TrustedForwarderUpdated with previous and new forwarder addresses
++     */
++    function updateTrustedForwarder(address _newForwarder) external;
++
++    /** @notice Retrieves the complete data for a specific asset
++     * @param _id Asset ID to query
++     * @return The AssetDefinition struct containing all asset data
++     */
++    function fetchAssetData(
++        uint256 _id
++    ) external view returns (AssetDefinition memory);
++
++    /** @notice Retrieves specific element of asset data based on flag
++     * @dev Flag values: 0=name, 1=description, 2=contractType, 3=isAggregated, 4=isDisabled,
++     *                   5=isSetup, 6=cut, 7=limit, 8=token, 9=issuer, 10=rewardDistributor, 11=vault
++     * @param _id The ID of the asset to fetch from
++     * @param _flag The flag indicating which element to fetch
++     * @return The requested element value encoded as bytes
++     */
++    function fetchAssetElement(
++        uint256 _id,
++        uint8 _flag
++    ) external view returns (bytes memory);
++
++    /** @notice Fetches the USST-Pegged token contract address used in the system
++     * @dev This represents the main stablecoin contract address
++     * @return The contract address of the USD-Pegged token
++     */
++    function fetchUSSTToken() external view returns (address);
++
++    /** @notice Fetches the USD-Interest token contract address used in the system
++     * @dev This represents the interest-bearing stablecoin contract address
++     * @return The contract address of the USD-Interest token
++     */
++    function fetchYLDToken() external view returns (address);
++
++    /** @notice Retrieves the Core contract address
++     * @return The address of the Core contract
++     */
++    function fetchCore() external view returns (address);
++
++    /** @notice Retrieves the treasury address
++     * @return The address of the treasury contract
++     */
++    function fetchTreasury() external view returns (address);
++
++    /** @notice Retrieves the current counter value
++     * @dev The counter tracks the total number of assets added to the registry
++     * @return The current counter value
++     */
++    function fetchCounter() external view returns (uint256);
++
++    /** @notice Retrieves the total deposit amount for a specific asset
++     * @param _assetID The ID of the asset to query
++     * @return The total amount deposited for the specified asset
++     */
++    function fetchDeposits(uint256 _assetID) external view returns (uint256);
++
++    /** @notice Checks if adding a deposit amount would exceed the asset's deposit limit
++     * @param _assetID The ID of the asset to check deposit limit for
++     * @param _amount The amount proposed to be deposited
++     * @return True if the deposit limit would be exceeded, false otherwise
++     */
++    function isDepositLimitReached(
++        uint256 _assetID,
++        uint256 _amount
++    ) external view returns (bool);
++
++    /** @notice Returns the address of the trusted forwarder for meta-transactions
++     * @dev Used by ERC2771Context to validate meta-transaction relayers
++     * @return The address of the current trusted forwarder
++     */
++    function trustedForwarder() external view returns (address);
++}
+diff -ruN sources/STBL_PT1_Vault-OUSG//prior/node_modules/@stbl-protocol/stbl-contracts-evm-core/contracts/lib/STBL_AssetDefinitionLib.sol sources/STBL_PT1_Vault-OUSG//current/node_modules/@stbl-protocol/stbl-contracts-evm-core/contracts/lib/STBL_AssetDefinitionLib.sol
+--- sources/STBL_PT1_Vault-OUSG//prior/node_modules/@stbl-protocol/stbl-contracts-evm-core/contracts/lib/STBL_AssetDefinitionLib.sol	1969-12-31 21:00:00
++++ sources/STBL_PT1_Vault-OUSG//current/node_modules/@stbl-protocol/stbl-contracts-evm-core/contracts/lib/STBL_AssetDefinitionLib.sol	2026-09-24 23:43:09
+@@ -0,0 +1,128 @@
++// SPDX-License-Identifier: MIT
++pragma solidity ^0.8.20;
++
++import "./STBL_Structs.sol";
++
++/**
++ * @title STBL_AssetDefinitionLib
++ * @notice Library providing utility functions for AssetDefinition struct operations
++ * @dev This library contains pure functions for validating, checking status, and calculating fees for asset definitions
++ */
++library STBL_AssetDefinitionLib {
++    /**
++     * @notice Checks if an asset definition is valid by verifying all required fields are set
++     * @dev Validates that id is non-zero, name is not empty, and all addresses are non-zero
++     * @param asset The asset definition to validate
++     * @return True if the asset definition is valid, false otherwise
++     */
++    function isValid(
++        AssetDefinition memory asset
++    ) internal pure returns (bool) {
++        return
++            asset.id != 0 &&
++            bytes(asset.name).length > 0 &&
++            asset.token != address(0) &&
++            asset.issuer != address(0) &&
++            asset.rewardDistributor != address(0) &&
++            asset.vault != address(0);
++    }
++
++    /**
++     * @notice Checks if an asset is active and available for use
++     * @dev An asset is considered active if it's setup and not disabled
++     * @param asset The asset definition to check
++     * @return True if the asset is active, false otherwise
++     */
++    function isActive(
++        AssetDefinition memory asset
++    ) internal pure returns (bool) {
++        return asset.status == AssetStatus.ENABLED;
++    }
++
++    /**
++     * @notice Calculates yield fees for a given amount
++     * @dev Calculates yield fee for given amount based on asset configuration using basis points (10000 = 100%)
++     * @param asset The asset definition with yield fee configuration
++     * @param amount The amount to calculate yield fee for
++     * @return netAmount The amount after deducting yield fee
++     * @return yieldFee The calculated yield fee amount
++     */
++    function calculateYieldFee(
++        AssetDefinition memory asset,
++        uint256 amount
++    ) internal pure returns (uint256, uint256) {
++        uint256 yieldFee = (amount * asset.yieldFees) / FEES_CONSTANT; // Assuming fee is in basis points
++        return (amount - yieldFee, yieldFee);
++    }
++
++    /**
++     * @notice Checks if an address matches the token address of an asset
++     * @dev Compares the provided account address with the asset's token address
++     * @param asset The asset definition to check
++     * @param account The address to compare
++     * @return True if the address matches the token address, false otherwise
++     */
++    function isToken(
++        AssetDefinition memory asset,
++        address account
++    ) internal pure returns (bool) {
++        return account == asset.token;
++    }
++
++    /**
++     * @notice Checks if an address matches the vault address of an asset
++     * @dev Compares the provided account address with the asset's vault address
++     * @param asset The asset definition to check
++     * @param account The address to compare
++     * @return True if the address matches the vault address, false otherwise
++     */
++    function isVault(
++        AssetDefinition memory asset,
++        address account
++    ) internal pure returns (bool) {
++        return account == asset.vault;
++    }
++
++    /**
++     * @notice Checks if an address matches the issuer address of an asset
++     * @dev Compares the provided account address with the asset's issuer address
++     * @param asset The asset definition to check
++     * @param account The address to compare
++     * @return True if the address matches the issuer address, false otherwise
++     */
++    function isIssuer(
++        AssetDefinition memory asset,
++        address account
++    ) internal pure returns (bool) {
++        return account == asset.issuer;
++    }
++
++    /**
++     * @notice Checks if an address matches the reward distributor address of an asset
++     * @dev Compares the provided account address with the asset's reward distributor address
++     * @param asset The asset definition to check
++     * @param account The address to compare
++     * @return True if the address matches the reward distributor address, false otherwise
++     */
++    function isDistributor(
++        AssetDefinition memory asset,
++        address account
++    ) internal pure returns (bool) {
++        return account == asset.rewardDistributor;
++    }
++
++    /**
++     * @notice Creates a string representation of the asset's contract type
++     * @dev Maps numeric contract type to human-readable string representation
++     * @param asset The asset definition
++     * @return The contract type as a string ("ERC20", "ERC721", "Custom", or "Unknown")
++     */
++    function getContractTypeString(
++        AssetDefinition memory asset
++    ) internal pure returns (string memory) {
++        if (asset.contractType == 0) return "ERC20";
++        if (asset.contractType == 1) return "ERC721";
++        if (asset.contractType == 2) return "Custom";
++        return "Unknown";
++    }
++}
+diff -ruN sources/STBL_PT1_Vault-OUSG//prior/node_modules/@stbl-protocol/stbl-contracts-evm-core/contracts/lib/STBL_DecimalConverter.sol sources/STBL_PT1_Vault-OUSG//current/node_modules/@stbl-protocol/stbl-contracts-evm-core/contracts/lib/STBL_DecimalConverter.sol
+--- sources/STBL_PT1_Vault-OUSG//prior/node_modules/@stbl-protocol/stbl-contracts-evm-core/contracts/lib/STBL_DecimalConverter.sol	1969-12-31 21:00:00
++++ sources/STBL_PT1_Vault-OUSG//current/node_modules/@stbl-protocol/stbl-contracts-evm-core/contracts/lib/STBL_DecimalConverter.sol	2026-09-24 23:43:09
+@@ -0,0 +1,127 @@
++// SPDX-License-Identifier: MIT
++pragma solidity ^0.8.0;
++
++/**
++ * @title DecimalConverter
++ * @dev Library for converting token amounts between different decimal representations
++ * @notice Provides utility functions for handling decimal conversions between ERC20 tokens
++ * @author Smart Contract Developer
++ */
++library DecimalConverter {
++    /**
++     * @dev Convert token amount from source decimal to target decimal
++     * @notice Converts token amounts between different decimal precisions without overflow protection
++     * @param amount The token amount to convert
++     * @param sourceDecimals Decimal places of the source token (e.g., 6 for USDC)
++     * @param targetDecimals Decimal places of the target token (e.g., 18 for ETH)
++     * @return convertedAmount Converted token amount in target decimal precision
++     */
++    function convertDecimals(
++        uint256 amount,
++        uint8 sourceDecimals,
++        uint8 targetDecimals
++    ) internal pure returns (uint256 convertedAmount) {
++        // If decimals are the same, return original amount
++        if (sourceDecimals == targetDecimals) {
++            return amount;
++        }
++
++        // Handle conversion based on decimal difference
++        if (sourceDecimals > targetDecimals) {
++            // Reduce precision
++            uint256 decimalDifference = sourceDecimals - targetDecimals;
++            return amount / (10 ** decimalDifference);
++        } else {
++            // Increase precision
++            uint256 decimalDifference = targetDecimals - sourceDecimals;
++            return amount * (10 ** decimalDifference);
++        }
++    }
++
++    /**
++     * @dev Safely convert token amount with overflow protection
++     * @notice Converts token amounts between different decimal precisions with overflow protection
++     * @param amount The token amount to convert
++     * @param sourceDecimals Decimal places of the source token (e.g., 6 for USDC)
++     * @param targetDecimals Decimal places of the target token (e.g., 18 for ETH)
++     * @return convertedAmount Converted token amount in target decimal precision
++     * @custom:reverts "Decimal conversion would cause overflow" if multiplication would overflow uint256
++     */
++    function safeConvertDecimals(
++        uint256 amount,
++        uint8 sourceDecimals,
++        uint8 targetDecimals
++    ) internal pure returns (uint256 convertedAmount) {
++        // If decimals are the same, return original amount
++        if (sourceDecimals == targetDecimals) {
++            return amount;
++        }
++
++        // Handle conversion based on decimal difference
++        if (sourceDecimals > targetDecimals) {
++            // Reduce precision
++            uint256 decimalDifference = sourceDecimals - targetDecimals;
++            return amount / (10 ** decimalDifference);
++        } else {
++            // Increase precision with overflow check
++            uint256 decimalDifference = targetDecimals - sourceDecimals;
++
++            // Check for potential overflow
++            if (amount > type(uint256).max / (10 ** decimalDifference)) {
++                revert("Decimal conversion would cause overflow");
++            }
++
++            return amount * (10 ** decimalDifference);
++        }
++    }
++
++    /**
++     * @dev Get normalized amount based on standard 18 decimals
++     * @notice Converts any token amount to 18 decimal precision for standardized calculations
++     * @param amount Token amount to normalize in its native decimal precision
++     * @param tokenDecimals Decimal places of the token (e.g., 6 for USDC, 8 for WBTC)
++     * @return normalizedAmount Normalized amount in 18 decimal precision
++     */
++    function normalizeToDecimals18(
++        uint256 amount,
++        uint8 tokenDecimals
++    ) internal pure returns (uint256 normalizedAmount) {
++        return convertDecimals(amount, tokenDecimals, 18);
++    }
++
++    /**
++     * @dev Convert 18 decimal amount to specific token decimals
++     * @notice Converts standardized 18 decimal amounts back to token's native decimal precision
++     * @param amount Amount in 18 decimal precision
++     * @param tokenDecimals Target token decimal places (e.g., 6 for USDC, 8 for WBTC)
++     * @return convertedAmount Converted amount in target token's native decimal precision
++     */
++    function convertFrom18Decimals(
++        uint256 amount,
++        uint8 tokenDecimals
++    ) internal pure returns (uint256 convertedAmount) {
++        return convertDecimals(amount, 18, tokenDecimals);
++    }
++
++    /**
++     * @dev Get token's native decimal precision
++     * @notice Retrieves the decimal precision of an ERC20 token via low-level call
++     * @param tokenAddress Address of the ERC20 token contract
++     * @return decimals Token's decimal places (defaults to 18 if call fails)
++     */
++    function getTokenDecimals(
++        address tokenAddress
++    ) internal view returns (uint8 decimals) {
++        // Create minimal interface for decimals
++        (bool success, bytes memory data) = tokenAddress.staticcall(
++            abi.encodeWithSignature("decimals()")
++        );
++
++        // Return 18 as default if call fails
++        if (!success || data.length == 0) {
++            return 18;
++        }
++
++        return abi.decode(data, (uint8));
++    }
++}
+diff -ruN sources/STBL_PT1_Vault-OUSG//prior/node_modules/@stbl-protocol/stbl-contracts-evm-core/contracts/lib/STBL_Errors.sol sources/STBL_PT1_Vault-OUSG//current/node_modules/@stbl-protocol/stbl-contracts-evm-core/contracts/lib/STBL_Errors.sol
+--- sources/STBL_PT1_Vault-OUSG//prior/node_modules/@stbl-protocol/stbl-contracts-evm-core/contracts/lib/STBL_Errors.sol	1969-12-31 21:00:00
++++ sources/STBL_PT1_Vault-OUSG//current/node_modules/@stbl-protocol/stbl-contracts-evm-core/contracts/lib/STBL_Errors.sol	2026-09-24 23:43:09
+@@ -0,0 +1,141 @@
++// SPDX-License-Identifier: MIT
++pragma solidity ^0.8.20;
++
++/**
++ * @notice Thrown when an unauthorized caller attempts to access a restricted function
++ */
++error STBL_UnauthorizedCaller();
++
++/**
++ * @notice Thrown when attempting to set up an asset with invalid parameters
++ */
++error STBL_InvalidAssetSetup();
++
++/**
++ * @notice Thrown when attempting to set up an asset with invalid parameters
++ */
++error STBL_InvalidAssetName();
++
++/**
++ * @notice Thrown when the setup has already been completed
++ */
++error STBL_SetupAlreadyDone();
++
++/**
++ * @notice Thrown when an asset is not active
++ */
++error STBL_AssetNotActive();
++
++/**
++ * @notice Thrown when an asset is active
++ */
++error STBL_AssetActive();
++
++/**
++ * @notice Thrown when an invalid address is provided
++ */
++error STBL_InvalidAddress();
++
++/**
++ * @notice Thrown when an invalid Yield Duration and duration are provided
++ */
++error STBL_InvalidDuration();
++
++/**
++ * @notice Thrown when an invalid treasury address is provided
++ */
++error STBL_InvalidTreasury();
++
++/**
++ * @notice Thrown when an unauthorized issuer attempts an operation
++ */
++error STBL_UnauthorizedIssuer();
++
++/**
++ * @notice Thrown when an invalid cut percentage is provided
++ * @param cut The invalid cut percentage that was provided
++ */
++error STBL_InvalidCutPercentage(uint256 cut);
++
++/**
++ * @notice Thrown when a maximum limit has been reached
++ */
++error STBL_MaxLimitReached();
++
++/**
++ * @notice Thrown when YLD functionality is disabled
++ * @param id The ID of the YLD that is disabled
++ */
++error STBL_YLDDisabled(uint256 id);
++
++/**
++ * @notice Thrown when an invalid flag value is provided
++ * @param flag The invalid flag value that was provided
++ */
++error STBL_InvalidFlagValue(uint8 flag);
++
++/**
++ * @notice Thrown when attempting to disable an already disabled asset
++ * @param id The ID of the asset that is already disabled
++ */
++error STBL_AssetDisabled(uint256 id);
++
++/**
++ * @notice Thrown when attempting to enable an already enabled asset
++ * @param id The ID of the asset that is already enabled
++ */
++error STBL_AssetEnabled(uint256 id);
++
++/**
++ * @notice Thrown when an invalid fee percentage is provided
++ * @param fee The invalid fee percentage that was provided
++ */
++error STBL_InvalidFeePercentage(uint256 fee);
++
++/**
++ * @notice Thrown when attempting to disable an already disabled insurance
++ * @param id The ID of the insurance that is already disabled
++ */
++error STBL_IssuanceAlreadyDisabled(uint256 id);
++
++/**
++ * @notice Thrown when attempting to enable an already enabled insurance
++ * @param id The ID of the insurance that is already enabled
++ */
++error STBL_IssuanceAlreadyEnabled(uint256 id);
++
++/**
++ * @notice Thrown when the caller is not the owner of the NFT
++ * @param tokenId The ID of the token for which ownership is required
++ */
++error STBL_YLD_NotOwner(uint256 tokenId);
++
++/**
++ * @notice Thrown when attempting to enable an already enabled NFT
++ * @param tokenId The ID of the token that is already enabled
++ */
++error STBL_YLD_AlreadyEnabled(uint256 tokenId);
++
++/**
++ * @notice Thrown when attempting to disable an already disabled NFT
++ * @param tokenId The ID of the token that is already disabled
++ */
++error STBL_YLD_AlreadyDisabled(uint256 tokenId);
++
++/**
++ * @notice Thrown when attempting to transfer a token that has transfers disabled
++ * @param tokenId The ID of the token that cannot be transferred
++ */
++error STBL_YLD_TransferDisabled(uint256 tokenId);
++
++/**
++ * @notice Thrown when the sender address is blacklisted
++ * @param sender The blacklisted sender address
++ */
++error STBL_USST_SenderBlacklisted(address sender);
++
++/**
++ * @notice Thrown when the recipient address is blacklisted
++ * @param recipient The blacklisted recipient address
++ */
++error STBL_USST_RecipientBlacklisted(address recipient);
+diff -ruN sources/STBL_PT1_Vault-OUSG//prior/node_modules/@stbl-protocol/stbl-contracts-evm-core/contracts/lib/STBL_Structs.sol sources/STBL_PT1_Vault-OUSG//current/node_modules/@stbl-protocol/stbl-contracts-evm-core/contracts/lib/STBL_Structs.sol
+--- sources/STBL_PT1_Vault-OUSG//prior/node_modules/@stbl-protocol/stbl-contracts-evm-core/contracts/lib/STBL_Structs.sol	1969-12-31 21:00:00
++++ sources/STBL_PT1_Vault-OUSG//current/node_modules/@stbl-protocol/stbl-contracts-evm-core/contracts/lib/STBL_Structs.sol	2026-09-24 23:43:09
+@@ -0,0 +1,176 @@
++// SPDX-License-Identifier: MIT
++pragma solidity ^0.8.20;
++
++/**
++ * @title STBL Protocol Structs
++ * @notice Core data structures used throughout the STBL Protocol
++ * @dev This file contains all the essential data structures that define the protocol's architecture
++ */
++
++/**
++ * @title YLD_Metadata
++ * @notice Metadata structure for yield-bearing tokens
++ * @dev Stores essential information about yield tokens including values, fees, and operational state
++ */
++struct YLD_Metadata {
++    /** @notice Unique identifier for the asset */
++    uint256 assetID;
++    /** @notice URI pointing to token metadata following standard metadata format */
++    string uri;
++    /** @notice Value representing the amount of the asset deposited in native asset units */
++    uint256 assetValue;
++    /** @notice The total USD value of tokens deposited in the protocol before any adjustments */
++    uint256 stableValueGross;
++    /** @notice The net USD value of USP tokens minted by the protocol after applying haircuts and fees */
++    uint256 stableValueNet;
++    /** @notice Block Timestamp when the deposit was made for time-based calculations */
++    uint256 depositTimestamp;
++    /** @notice Absolute fee amount charged on asset deposits in wei */
++    uint256 depositfeeAmount;
++    /** @notice Absolute haircut amount taken in USD terms as protocol fee */
++    uint256 haircutAmount;
++    /** @notice Absolute haircut amount taken in asset terms as protocol fee */
++    uint256 haircutAmountAssetValue;
++    /** @notice Absolute fee amount charged on asset withdrawals in wei */
++    uint256 withdrawfeeAmount;
++    /** @notice Absolute fee amount allocated to insurance pool in wei */
++    uint256 insurancefeeAmount;
++    /** @notice Snapshot of fee structure at the time of deposit for consistency */
++    FeeStruct Fees;
++    /** @notice Additional data buffer for future extensibility and upgrades */
++    bytes additionalBuffer;
++    /** @notice Flag indicating if token is disabled and cannot be used */
++    bool isDisabled;
++}
++
++/**
++ * @title AssetStatus
++ * @notice Enumeration defining the operational status of assets within the protocol
++ * @dev Used to track asset lifecycle and control operational permissions
++ * @param INACTIVE Asset is not yet configured or deployed
++ * @param INITIALIZED Asset is configured but not yet active for operations
++ * @param ENABLED Asset is fully operational and available for deposits/withdrawals
++ * @param DISABLED Asset is temporarily disabled but can be reactivated
++ * @param EMERGENCY_STOP Asset is in emergency state with all operations halted
++ */
++enum AssetStatus {
++    INACTIVE,
++    INITIALIZED,
++    ENABLED,
++    DISABLED,
++    EMERGENCY_STOP
++}
++
++/**
++ * @title AssetDefinition
++ * @notice Structure defining comprehensive properties of an asset in the protocol
++ * @dev Contains all configuration parameters, addresses, and operational settings for an asset
++ */
++struct AssetDefinition {
++    /** @notice Unique identifier assigned to the asset within the protocol */
++    uint256 id;
++    /** @notice Human-readable name of the asset for display purposes */
++    string name;
++    /** @notice Detailed description of the asset and its characteristics */
++    string description;
++    /** @notice Type of contract (ERC20 = 0, ERC721 = 1, Custom = 2) */
++    uint8 contractType;
++    /** @notice Flag indicating if yields are aggregated for this asset across all deposits */
++    bool isAggreagated;
++    /** @notice Current operational status of the asset (INACTIVE, INITIALIZED, ENABLED, DISABLED) */
++    AssetStatus status;
++    /** @notice Haircut percentage taken by the protocol in basis points */
++    uint256 cut;
++    /** @notice Maximum allowable deposit amount for this asset in native units */
++    uint256 limit;
++    /** @notice Contract address of the underlying token */
++    address token;
++    /** @notice Address responsible for asset issuance and management */
++    address issuer;
++    /** @notice Address responsible for distributing rewards to token holders */
++    address rewardDistributor;
++    /** @notice Address of the oracle providing price feeds and market data */
++    address oracle;
++    /** @notice Address of the custodian vault holding the actual assets */
++    address vault;
++    /** @notice Fee percentage charged on deposits in basis points */
++    uint256 depositFees;
++    /** @notice Fee percentage charged on withdrawals in basis points */
++    uint256 withdrawFees;
++    /** @notice Fee percentage charged on yield generation in basis points */
++    uint256 yieldFees;
++    /** @notice Percentage of fees allocated to insurance pool in basis points */
++    uint256 insuranceFees;
++    /** @notice Time duration in seconds for which asset must remain locked post deposit */
++    uint256 duration;
++    /** @notice Time interval in seconds between yield distribution events */
++    uint256 yieldDuration;
++    /** @notice Additional data buffer for future extensibility and protocol upgrades */
++    bytes additionalBuffer;
++}
++
++/**
++ * @title stakingStruct
++ * @notice Data structure tracking token staking details for protocol participants
++ * @dev Used to manage individual staking positions, rewards, and distribution tracking
++ * @custom:security Balance must never underflow, implement proper checks before withdrawals
++ * @custom:security RewardIndex must be properly synchronized with global reward calculations
++ */
++struct stakingStruct {
++    /** @notice Current staked balance of the participant in wei */
++    uint256 balance;
++    /** @notice Index tracking participant's position in yield distribution calculations */
++    uint256 rewardIndex;
++    /** @notice Total rewards earned but not yet claimed by the participant */
++    uint256 earned;
++    /** @notice Flag indicating if staking position is currently active and earning rewards */
++    bool isActive;
++}
++
++/**
++ * @title VaultStruct
++ * @notice Structure tracking protocol vault metrics and cumulative financial data
++ * @dev Comprehensive record of all fees, deposits, and protocol revenue streams
++ * @custom:security All fee calculations must prevent overflow and maintain precision
++ */
++struct VaultStruct {
++    /** @notice Total accumulated fees from asset deposits across all assets */
++    uint256 depositFees;
++    /** @notice Total accumulated fees from asset withdrawals across all assets */
++    uint256 withdrawFees;
++    /** @notice Total accumulated fees from insurance contributions */
++    uint256 insuranceFees;
++    /** @notice Total accumulated fees from yield generation activities */
++    uint256 yieldFees;
++    /** @notice Cumulative total of all haircut fees collected by protocol in USD */
++    uint256 cumilativeHairCutValue;
++    /** @notice Current USD value of all deposits held in the vault */
++    uint256 depositValueUSD;
++    /** @notice Total gross value of asset deposits before any deductions */
++    uint256 assetDepositGross;
++    /** @notice Net value of asset deposits after haircuts and fees are applied */
++    uint256 assetDepositNet;
++}
++
++/**
++ * @title FeeStruct
++ * @notice Structure defining fee configuration for various protocol operations
++ * @dev Contains granular fee settings and timing parameters for protocol actions
++ * @custom:security All fee percentages should be validated to prevent excessive fees
++ */
++struct FeeStruct {
++    /** @notice Fee percentage charged on asset deposits in basis points */
++    uint256 depositFee;
++    /** @notice Percentage of deposit value taken as protocol haircut in basis points */
++    uint256 hairCut;
++    /** @notice Fee percentage charged on asset withdrawals in basis points */
++    uint256 withdrawFee;
++    /** @notice Percentage of total fees allocated to insurance pool in basis points */
++    uint256 insuranceFee;
++    /** @notice Lock duration in seconds for deposited assets */
++    uint256 duration;
++    /** @notice Time interval in seconds between yield distribution events */
++    uint256 yieldDuration;
++}
++
++uint256 constant FEES_CONSTANT = 10 ** 9;

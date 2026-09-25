@@ -1,0 +1,16 @@
+{
+  "label": "STBL_USST",
+  "chainid": 56,
+  "proxy": "0x1171ce10262a60c17507580a3b70b956f20a35de",
+  "impl_slot": null,
+  "beacon_slot": null,
+  "admin_slot": null,
+  "current_impl": null,
+  "prior_impl": null,
+  "upgrade_history": [],
+  "upgrade_history_error": "NOTOK",
+  "current_impl_creation": {},
+  "classify_timestamp": null,
+  "classify_datetime_utc": null,
+  "classification": "UNKNOWN"
+}
