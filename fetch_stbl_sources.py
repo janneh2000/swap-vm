@@ -179,6 +179,8 @@ def main():
     if not KEY:
         print("FATAL: ETHERSCAN_API_KEY not set in environment. `export ETHERSCAN_API_KEY=...` and retry.")
         sys.exit(2)
+    for d in ("sources", "metadata", "abis", "diff"):
+        (HERE / d).mkdir(parents=True, exist_ok=True)
     rows = []
     for label, chainid, proxy in TARGETS:
         print(f"[*] {label} ({'ETH' if chainid==1 else 'BSC'}) {proxy}")
