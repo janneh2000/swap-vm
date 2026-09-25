@@ -106,7 +106,11 @@ def main():
     # fetch source of everything discovered
     fetched={}
     for label,addr in [("Register",reg),("Core",core),("YLD",yld)]:
-        if addr: fetched[label]=get_source(addr,label); time.sleep(0.25)
+        if addr:
+            m=get_source(addr,label); fetched[label]=m; time.sleep(0.25)
+            impl=m.get("impl")
+            if impl and int(impl,16)!=0:
+                fetched[label+"Impl"]=get_source(impl.lower(),label+"Impl"); print(f"{label} impl:",impl); time.sleep(0.25)
     for i,addr in enumerate(splitters):
         fetched[f"SPLITTER{i}"]=get_source(addr,f"SPLITTER{i}"); time.sleep(0.25)
     topo["fetched"]=fetched
