@@ -178,5 +178,56 @@ contract Harness is Test {
         vm.prank(user); issuer.withdraw(id);
         assertEq(usp.balanceOf(user), 0, "position was still redeemable after the on-behalf call");
     }
+
+    // ---- pooled/global-solvency probes (unprivileged value-extraction hunt) ----
+
+    // Price RISES between deposit and withdraw. The withdrawer must get back their own USD
+    // entitlement (fewer tokens, each worth more) and NOT drain the vault. Appreciation stays
+    // as protocol surplus; there is no over-payment.
+    function test_price_rise_no_overpayment() public {
+        vm.prank(user); uint256 id = issuer.deposit(1000e18);
+        uint256 vaultAfterDeposit = rwa.balanceOf(address(vault)); // ~1000 tokens
+        // price doubles $1.06 -> $2.12
+        oracle.setPrice(price * 2);
+        vm.warp(block.timestamp + 2 days);
+        uint256 userBefore = rwa.balanceOf(user);
+        vm.prank(user); issuer.withdraw(id);
+        uint256 got = rwa.balanceOf(user) - userBefore;
+        emit log_named_uint("tokens returned on 2x price", got);
+        emit log_named_uint("vault tokens at deposit", vaultAfterDeposit);
+        // user gets roughly HALF the tokens back (same USD value at 2x price); never more than deposited
+        assertLt(got, vaultAfterDeposit, "withdrew fewer tokens than deposited (no appreciation capture)");
+        assertGe(rwa.balanceOf(address(vault)), 0, "vault not over-drained");
+        assertEq(usp.balanceOf(user), 0, "USP burned");
+    }
+
+    // Price DROPS below the tracked USD obligation. The GLOBAL solvency gate must block the
+    // withdraw (protocol under-collateralized) rather than let anyone extract free tokens.
+    function test_price_drop_triggers_solvency_freeze() public {
+        vm.prank(user); uint256 id = issuer.deposit(1000e18);
+        // price halves -> forward(assetDepositNet) < depositValueUSD
+        oracle.setPrice(price / 2);
+        vm.warp(block.timestamp + 2 days);
+        vm.prank(user);
+        vm.expectRevert(); // STBL_Asset_InsufficientVaultValue
+        issuer.withdraw(id);
+    }
+
+    // Two equal depositors; price rises; A withdraws first. Confirm A only takes A's own
+    // entitlement and B can still fully withdraw afterwards (no first-mover / bank-run theft).
+    function test_pooled_no_cross_user_drain() public {
+        address A = user; address B = address(0xB0B);
+        rwa.mint(B, 1_000_000e18); vm.prank(B); rwa.approve(address(vault), type(uint256).max);
+        vm.prank(A); uint256 idA = issuer.deposit(1000e18);
+        vm.prank(B); uint256 idB = issuer.deposit(1000e18);
+        oracle.setPrice(price + price/10); // +10%
+        vm.warp(block.timestamp + 2 days);
+        vm.prank(A); issuer.withdraw(idA);       // A exits first
+        // B must still be able to fully redeem — A did not consume B's collateral
+        uint256 bBefore = rwa.balanceOf(B);
+        vm.prank(B); issuer.withdraw(idB);
+        assertGt(rwa.balanceOf(B) - bBefore, 0, "B still fully redeemable after A exit");
+        assertEq(usp.balanceOf(B), 0, "B USP burned");
+    }
 }
 

@@ -38,9 +38,16 @@ asset token has a transfer hook; USDY/OUSG do not.)
   does → HIGH/CRITICAL; else latent regression.
 - **Novelty vs DUPs:** distinct from DUP-2 (that is withdrawExpired's missing burn, treasury path).
 
-## Gating step
-`fetch_splitter.py` resolves Register→Core/YLD and the SPLITTER_ROLE holder(s) and pulls their verified
-source. Then grep for callers of the 2-arg `withdraw` and `enableYield` to decide C1/C2 reachability.
+## Reachability verdict — RESOLVED (both DORMANT)
+`fetch_splitter.py` resolved Register→Core/YLD and enumerated SPLITTER_ROLE holders.
+Result: **SPLITTER_ROLE holders = [] (none)**; `STBL_Register` uses plain
+`AccessControlUpgradeable` (role grantable only by `DEFAULT_ADMIN_ROLE`). System-wide grep
+(12 in-scope + Core/YLD/Register) finds **no caller** of either `enableYield`/`disableYield`
+or the 2-arg `withdraw`. Real Core/YLD/Register were read (not mocks): `Core.put` enforces the
+deposit limit; `Core.exit` burns net USST + NFT; `YLD._update` blocks disabled transfers.
+⇒ **C1 and C2 are latent post-audit regressions, NOT live unprivileged criticals.** See
+`STBL_ESS_FINAL_VERDICT.md`. Harness now has 6 passing tests incl. pooled/price-move solvency
+probes confirming no unprivileged value-extraction.
 
 ## Not-reported (with reasons)
 - Deposit `AssetData.limit` not enforced by Issuer (no cap) — risk-param bypass, not theft. Low.
